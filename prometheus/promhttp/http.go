@@ -47,6 +47,7 @@ import (
 
 	"github.com/prometheus/client_golang/internal/github.com/golang/gddo/httputil"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp/delta"
 	"github.com/prometheus/client_golang/prometheus/promhttp/internal"
 )
 
@@ -281,6 +282,12 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 	h := http.HandlerFunc(func(rsp http.ResponseWriter, req *http.Request) {
 		if !opts.ProcessStartTime.IsZero() {
 			rsp.Header().Set(processStartTimeHeader, strconv.FormatInt(opts.ProcessStartTime.Unix(), 10))
+		}
+		// Delta exposition, when it has been switched on with delta.Enable and
+		// the scraper asked for it with ?delta=1. Off by default, in which case
+		// this is one atomic load. See the delta package.
+		if delta.ServeIfRequested(rsp, req) {
+			return
 		}
 		if inFlightSem != nil {
 			select {
