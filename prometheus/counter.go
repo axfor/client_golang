@@ -109,6 +109,11 @@ type counter struct {
 	valBits uint64
 	valInt  uint64
 
+	// track is the change-tracking hook, nil unless tracking is on. It is
+	// kept next to the value so the check on the write path reads the cache
+	// line the atomic already owns. See changetracking.go.
+	track dirtyRef
+
 	selfCollector
 	desc *Desc
 
@@ -119,6 +124,8 @@ type counter struct {
 	// now is for testing purposes, by default it's time.Now.
 	now func() time.Time
 }
+
+func (c *counter) trackRef() *dirtyRef { return &c.track }
 
 func (c *counter) Desc() *Desc {
 	return c.desc
@@ -132,6 +139,7 @@ func (c *counter) Add(v float64) {
 	ival := uint64(v)
 	if float64(ival) == v {
 		atomic.AddUint64(&c.valInt, ival)
+		c.track.mark()
 		return
 	}
 
@@ -139,6 +147,7 @@ func (c *counter) Add(v float64) {
 		oldBits := atomic.LoadUint64(&c.valBits)
 		newBits := math.Float64bits(math.Float64frombits(oldBits) + v)
 		if atomic.CompareAndSwapUint64(&c.valBits, oldBits, newBits) {
+			c.track.mark()
 			return
 		}
 	}
@@ -151,6 +160,7 @@ func (c *counter) AddWithExemplar(v float64, e Labels) {
 
 func (c *counter) Inc() {
 	atomic.AddUint64(&c.valInt, 1)
+	c.track.mark()
 }
 
 func (c *counter) get() float64 {

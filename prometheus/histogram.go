@@ -728,6 +728,11 @@ type histogram struct {
 	// http://golang.org/pkg/sync/atomic/#pkg-note-BUG
 	countAndHotIdx uint64
 
+	// track is the change-tracking hook, nil unless tracking is on. It is
+	// kept next to countAndHotIdx so the check at the end of observe reads
+	// the cache line the atomic already owns. See changetracking.go.
+	track dirtyRef
+
 	selfCollector
 	desc *Desc
 
@@ -900,6 +905,8 @@ func (h *histogram) findBucket(v float64) int {
 	return sort.SearchFloat64s(h.upperBounds, v)
 }
 
+func (h *histogram) trackRef() *dirtyRef { return &h.track }
+
 // observe is the implementation for Observe without the findBucket part.
 func (h *histogram) observe(v float64, bucket int) {
 	// Do not add to sparse buckets for NaN observations.
@@ -913,6 +920,7 @@ func (h *histogram) observe(v float64, bucket int) {
 	if doSparse {
 		h.limitBuckets(hotCounts, v, bucket)
 	}
+	h.track.mark()
 }
 
 // limitBuckets applies a strategy to limit the number of populated sparse

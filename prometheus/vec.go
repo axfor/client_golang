@@ -346,7 +346,10 @@ func (m *metricMap) Reset() {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	for h := range m.metrics {
+	for h, metrics := range m.metrics {
+		for _, mwlv := range metrics {
+			untrackMetric(mwlv.metric)
+		}
 		delete(m.metrics, h)
 	}
 }
@@ -370,6 +373,7 @@ func (m *metricMap) deleteByHashWithLabelValues(
 		return false
 	}
 
+	untrackMetric(metrics[i].metric) // drop it from the change-tracking table
 	if len(metrics) > 1 {
 		old := metrics
 		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
@@ -378,6 +382,34 @@ func (m *metricMap) deleteByHashWithLabelValues(
 		delete(m.metrics, h)
 	}
 	return true
+}
+
+// deleteMetric removes one specific metric from the hash bucket h, identified by
+// identity rather than by its label values. Change tracking uses it to drop an
+// instance it holds a reference to.
+func (m *metricMap) deleteMetric(h uint64, metric Metric) bool {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	metrics, ok := m.metrics[h]
+	if !ok {
+		return false
+	}
+	for i := range metrics {
+		if metrics[i].metric != metric {
+			continue
+		}
+		untrackMetric(metric)
+		if len(metrics) > 1 {
+			old := metrics
+			m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
+			old[len(old)-1] = metricWithLabelValues{}
+		} else {
+			delete(m.metrics, h)
+		}
+		return true
+	}
+	return false
 }
 
 // deleteByHashWithLabels removes the metric from the hash bucket h. If there
@@ -398,6 +430,7 @@ func (m *metricMap) deleteByHashWithLabels(
 		return false
 	}
 
+	untrackMetric(metrics[i].metric) // drop it from the change-tracking table
 	if len(metrics) > 1 {
 		old := metrics
 		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
@@ -420,6 +453,9 @@ func (m *metricMap) deleteByLabels(labels Labels, curry []curriedLabelValue) int
 		if i >= len(metrics) {
 			// Didn't find matching labels in this metric slice.
 			continue
+		}
+		for _, mwlv := range metrics {
+			untrackMetric(mwlv.metric)
 		}
 		delete(m.metrics, h)
 		numDeleted++
@@ -505,6 +541,7 @@ func (m *metricMap) getOrCreateMetricWithLabelValues(
 		inlinedLVs := inlineLabelValues(lvs, curry)
 		metric = m.newMetric(inlinedLVs...)
 		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: inlinedLVs, metric: metric})
+		trackMetric(m, metric, hash)
 	}
 	return metric
 }
@@ -530,6 +567,7 @@ func (m *metricMap) getOrCreateMetricWithLabels(
 		lvs := extractLabelValues(m.desc, labels, curry)
 		metric = m.newMetric(lvs...)
 		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: lvs, metric: metric})
+		trackMetric(m, metric, hash)
 	}
 	return metric
 }
