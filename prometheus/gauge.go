@@ -94,11 +94,18 @@ type gauge struct {
 	// operations.  http://golang.org/pkg/sync/atomic/#pkg-note-BUG
 	valBits uint64
 
+	// track is the change-tracking hook, kept next to the value so the check
+	// on the write path reads the cache line the atomic already owns. See
+	// changetracking.go.
+	track dirtyRef
+
 	selfCollector
 
 	desc       *Desc
 	labelPairs []*dto.LabelPair
 }
+
+func (g *gauge) trackRef() *dirtyRef { return &g.track }
 
 func (g *gauge) Desc() *Desc {
 	return g.desc
@@ -106,6 +113,7 @@ func (g *gauge) Desc() *Desc {
 
 func (g *gauge) Set(val float64) {
 	atomic.StoreUint64(&g.valBits, math.Float64bits(val))
+	g.track.mark()
 }
 
 func (g *gauge) SetToCurrentTime() {
@@ -125,6 +133,7 @@ func (g *gauge) Add(val float64) {
 		oldBits := atomic.LoadUint64(&g.valBits)
 		newBits := math.Float64bits(math.Float64frombits(oldBits) + val)
 		if atomic.CompareAndSwapUint64(&g.valBits, oldBits, newBits) {
+			g.track.mark()
 			return
 		}
 	}

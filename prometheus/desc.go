@@ -208,6 +208,17 @@ func (d *Desc) Err() error {
 	return d.err
 }
 
+// Name returns the fully-qualified metric name, i.e. Namespace, Subsystem and
+// Name joined together. Change-only and delta exposition group their output by
+// metric name and need it.
+func (d *Desc) Name() string { return d.fqName }
+
+// Help returns the help text.
+func (d *Desc) Help() string { return d.help }
+
+// Unit returns the unit, empty if none was set.
+func (d *Desc) Unit() string { return d.unit }
+
 func (d *Desc) String() string {
 	lpStrings := make([]string, 0, len(d.constLabelPairs))
 	for _, lp := range d.constLabelPairs {
