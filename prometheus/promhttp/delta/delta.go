@@ -45,6 +45,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -103,6 +104,30 @@ type Options struct {
 	// Vec that created it, and prometheus.DeleteTracked removes it directly.
 	Delete func(name string, labels prometheus.Labels)
 
+	// GenLabel, when set, adds this label to counter and histogram output, with
+	// the series' creation time in Unix seconds as its value, so that an instance
+	// deleted as idle and written to again is a different series.
+	//
+	// Without it a rebuilt counter relies on the collector spotting a counter
+	// reset, which it cannot do when the new value is not below the old one. The
+	// instances that go idle are exactly the low-traffic ones, whose old value is
+	// small, so it undercounts.
+	GenLabel string
+
+	// RebaseAfterGap, when greater than zero, makes the first scrape after a gap
+	// that long move to a new generation and report only what was never
+	// delivered: every counter and histogram reports its value minus the one it
+	// last delivered. Requires GenLabel, and cannot be combined with
+	// ReportIncrements, which needs no generation change.
+	//
+	// It exists because an aggregator forgets an input with no samples within
+	// staleness_interval by wall-clock time, while idle cleanup counts scrapes
+	// and does not advance while scraping is down. Without it, a gap longer than
+	// staleness_interval makes the whole cumulative value reported after recovery
+	// count as a new input, i.e. twice. Keep it below staleness_interval minus
+	// one scrape interval.
+	RebaseAfterGap time.Duration
+
 	// Gatherer selects the slower path that reads through a Gatherer instead of
 	// change tracking. Enable uses it when change tracking cannot be turned on
 	// early enough, for instance when metrics already exist.
@@ -121,6 +146,7 @@ type ScrapeStats struct {
 	Samples   int    // series written
 	Heartbeat int    // of those, how many were heartbeat top-ups
 	Deleted   int    // idle series dropped this scrape
+	Rebased   bool   // the gap since the last delivery exceeded RebaseAfterGap, so the generation moved
 	Delivered bool   // response fully written and the request not cancelled
 	Err       error
 }
@@ -129,6 +155,7 @@ type ScrapeStats struct {
 type Exposer struct {
 	g    prometheus.Gatherer
 	opts Options
+	rb   rebaseState
 
 	mu     sync.Mutex
 	round  uint64
@@ -149,14 +176,37 @@ type entry struct {
 	spare     []uint64          // buffer rotated with buckets
 	changed   uint64            // last scrape whose value differed from the delivered one
 	lastRound uint64            // last scrape this was seen in
+
+	born        int64 // creation time in Unix seconds, the value of GenLabel
+	basedOn     int64 // the generation the bases below belong to
+	baseValue   float64
+	baseSum     float64
+	baseCount   uint64
+	baseBuckets []uint64
 }
 
 // New returns an Exposer reading from g.
 func New(g prometheus.Gatherer, opts Options) *Exposer {
+	opts = check(opts)
+	return &Exposer{g: g, opts: opts, state: map[string]*entry{}}
+}
+
+// check fills in the defaults and rejects combinations that would silently
+// miscount.
+func check(opts Options) Options {
 	if opts.HeartbeatScrapes <= 0 {
 		opts.HeartbeatScrapes = 3
 	}
-	return &Exposer{g: g, opts: opts, state: map[string]*entry{}}
+	if opts.RebaseAfterGap > 0 && opts.GenLabel == "" {
+		panic("delta: RebaseAfterGap requires GenLabel")
+	}
+	if opts.ReportIncrements && opts.RebaseAfterGap > 0 {
+		panic("delta: ReportIncrements and RebaseAfterGap are mutually exclusive; reporting increments needs no generation change")
+	}
+	if opts.DisableHeartbeat && !opts.ReportIncrements && (opts.IdleScrapes <= 0 || opts.GenLabel == "") {
+		panic("delta: DisableHeartbeat without ReportIncrements requires IdleScrapes > 0 and GenLabel, or an idle instance the aggregator has forgotten is counted twice")
+	}
+	return opts
 }
 
 // Handler returns an http.Handler.
@@ -184,6 +234,7 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 
 	e.round++
 	st.Round = e.round
+	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
 	out, pending, heartbeat := e.plan(mfs)
 	st.Families, st.Heartbeat = len(out), heartbeat
 	for _, mf := range out {
@@ -202,6 +253,7 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 
 	if st.Delivered {
 		e.commit(pending)
+		e.rb.delivered()
 	}
 	st.Deleted = e.sweep()
 	return st
@@ -216,7 +268,10 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 			e.keyBuf = appendSeriesKey(e.keyBuf[:0], mf.GetName(), m.Label)
 			en := e.state[string(e.keyBuf)]
 			if en == nil {
-				en = &entry{family: mf.GetName(), labels: labelsOf(m.Label), kind: mf.GetType(), changed: e.round}
+				en = &entry{family: mf.GetName(), kind: mf.GetType(), changed: e.round, born: e.rb.clock().Unix()}
+				if e.opts.Delete != nil {
+					en.labels = labelsOf(m.Label)
+				}
 				e.state[string(e.keyBuf)] = en
 			}
 			en.lastRound = e.round
@@ -262,9 +317,13 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		if !changed && !e.heartbeatTurn(en) {
 			return false, false, nil
 		}
+		e.rb.rebaseEntry(en)
 		if e.opts.ReportIncrements {
 			*m.Counter.Value = cur - en.value // in place: Gather returns a fresh copy
+		} else if e.rb.gen != 0 {
+			*m.Counter.Value = cur - en.baseValue
 		}
+		e.stamp(m, en)
 		return true, !changed, &pendingCommit{en: en, value: cur}
 
 	case dto.MetricType_HISTOGRAM:
@@ -289,6 +348,7 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		if !changed && !e.heartbeatTurn(en) {
 			return false, false, nil
 		}
+		e.rb.rebaseEntry(en)
 		if e.opts.ReportIncrements {
 			*h.SampleSum = sum - en.sum
 			*h.SampleCount = count - en.count
@@ -299,7 +359,14 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 				}
 				*b.CumulativeCount = b.GetCumulativeCount() - prev
 			}
+		} else if e.rb.gen != 0 {
+			*h.SampleSum = sum - en.baseSum
+			*h.SampleCount = count - en.baseCount
+			for i, b := range h.Bucket {
+				*b.CumulativeCount = b.GetCumulativeCount() - en.baseBucket(i)
+			}
 		}
+		e.stamp(m, en)
 		return true, !changed, &pendingCommit{en: en, sum: sum, count: count, buckets: buckets}
 
 	case dto.MetricType_GAUGE:
@@ -315,6 +382,26 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		// summary / untyped: quantiles are not additive, pass them through.
 		return true, false, nil
 	}
+}
+
+// stamp puts the generation label on a counter or histogram. Gauges never carry
+// it: they are current values, not something that accumulates across a rebuild.
+func (e *Exposer) stamp(m *dto.Metric, en *entry) {
+	if e.opts.GenLabel == "" {
+		return
+	}
+	applyGen(m, e.opts.GenLabel, e.rb.genOf(en))
+}
+
+// deletable reports whether an idle series may be dropped.
+//
+// A gauge is only droppable at zero. An Inc/Dec gauge such as a count of
+// in-flight requests sits at a non-zero value for as long as the request runs,
+// without being written again; deleting it there would leave the Dec that ends
+// the request to land on an instance rebuilt from zero and send the gauge
+// negative.
+func deletable(en *entry) bool {
+	return en.kind != dto.MetricType_GAUGE || en.value == 0
 }
 
 // heartbeatTurn reports whether an unchanged series is due for a top-up.
@@ -346,7 +433,7 @@ func (e *Exposer) sweep() int {
 	}
 	n := 0
 	for k, en := range e.state {
-		if en.lastRound == e.round && e.round-en.changed > idle {
+		if en.lastRound == e.round && e.round-en.changed > idle && deletable(en) {
 			delete(e.state, k)
 			if e.opts.Delete != nil {
 				e.opts.Delete(en.family, en.labels)

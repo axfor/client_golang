@@ -48,6 +48,7 @@ import (
 type TrackedExposer struct {
 	opts    Options
 	tracker *prometheus.ChangeTracker
+	rb      rebaseState
 
 	mu      sync.Mutex
 	round   uint64
@@ -62,9 +63,7 @@ type TrackedExposer struct {
 // prometheus.CurrentChangeTracker(). Metrics have to have been created after
 // prometheus.SetChangeTracker(t), or they are not tracked.
 func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
-	if opts.HeartbeatScrapes <= 0 {
-		opts.HeartbeatScrapes = 3
-	}
+	opts = check(opts)
 	if t == nil {
 		t = prometheus.CurrentChangeTracker()
 	}
@@ -89,6 +88,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	st := ScrapeStats{}
 	e.round++
 	st.Round = e.round
+	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
 
 	e.buf = e.buf[:0]
 	clear(e.byName)
@@ -116,7 +116,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 			if en == nil {
 				return // a new instance not taken yet; leave it for the next scrape
 			}
-			if e.opts.IdleScrapes > 0 && e.round-en.changed > uint64(e.opts.IdleScrapes) {
+			if e.opts.IdleScrapes > 0 && e.round-en.changed > uint64(e.opts.IdleScrapes) && deletable(en) {
 				idle = append(idle, en)
 				en.metric = m
 				return
@@ -150,6 +150,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 
 	if st.Delivered {
 		e.commit(pending)
+		e.rb.delivered()
 	} else {
 		// undelivered: put them back so the next scrape reports them again,
 		// together with whatever accrues in the meantime
@@ -173,7 +174,7 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 	desc := m.Desc()
 	en := e.state[m]
 	if en == nil {
-		en = &entry{family: desc.Name(), changed: e.round}
+		en = &entry{family: desc.Name(), changed: e.round, born: e.rb.clock().Unix()}
 		e.state[m] = en
 	}
 	en.lastRound = e.round
@@ -189,15 +190,20 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 	if mf == nil {
 		return nil, false
 	}
+	en.kind = mf.GetType()
+	// Capture the labels before decide stamps the generation on them: they are
+	// handed to Options.Delete, which looks the child up in its Vec, and the Vec
+	// has no generation label. Only needed when there is a callback; without one
+	// idle cleanup goes through prometheus.DeleteTracked.
+	if en.labels == nil && e.opts.Delete != nil {
+		en.labels = labelsOf(out.Label)
+	}
 	emit, _, pc := e.decide(mf, out, en)
 	if !emit && !heartbeat {
 		// unchanged, e.g. added and subtracted again within one scrape: skip it,
 		// without affecting the next scrape
 		mf.Metric = mf.Metric[:len(mf.Metric)-1]
 		return pc, true
-	}
-	if en.labels == nil {
-		en.labels = labelsOf(out.Label)
 	}
 	return pc, true
 }
@@ -222,7 +228,7 @@ func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric) *dto.Metri
 
 // decide reuses Exposer's change-only and delta logic.
 func (e *TrackedExposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, bool, *pendingCommit) {
-	shim := &Exposer{opts: e.opts, round: e.round}
+	shim := &Exposer{opts: e.opts, round: e.round, rb: e.rb}
 	return shim.decide(mf, m, en)
 }
 
