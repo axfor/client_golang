@@ -212,20 +212,28 @@ func stampFallback(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, 
 	}
 }
 
-// applyGen adds or updates one label on a metric. The label slice handed out by
-// Write belongs to the metric itself, so it is copied rather than appended to.
+// applyGen puts the generation on a metric, replacing a label of that name if
+// the metric carries one. Write hands out the metric's own label slice, so a
+// value written into it in place would change the metric itself; the slice is
+// rebuilt instead.
 func applyGen(m *dto.Metric, name string, gen int64) {
 	value := strconv.FormatInt(gen, 10)
-	for _, lp := range m.Label {
-		if lp.GetName() == name {
-			lp.Value = &value
-			return
-		}
-	}
-	labels := make([]*dto.LabelPair, len(m.Label), len(m.Label)+1)
-	copy(labels, m.Label)
 	n := name
-	m.Label = append(labels, &dto.LabelPair{Name: &n, Value: &value})
+	at, replace := genIndex(m.Label, name)
+	m.Label = withLabel(m.Label, &dto.LabelPair{Name: &n, Value: &value}, at, replace)
+}
+
+// withLabel returns labels with lp at index at, dropping what is there when the
+// metric already carries a label of that name. The label slice handed out by
+// Write belongs to the metric itself, so it is copied rather than written into.
+func withLabel(labels []*dto.LabelPair, lp *dto.LabelPair, at int, replace bool) []*dto.LabelPair {
+	out := make([]*dto.LabelPair, 0, len(labels)+1)
+	out = append(out, labels[:at]...)
+	out = append(out, lp)
+	if replace {
+		at++
+	}
+	return append(out, labels[at:]...)
 }
 
 func handled(mf *dto.MetricFamily) bool {
@@ -269,7 +277,15 @@ func buildLabels(dst []byte, m *dto.Metric, genLabel string, gen int64) ([]byte,
 		return dst, true
 	}
 	sep := byte('{')
-	for _, lp := range m.Label {
+	at, replace := genIndex(m.Label, genLabel)
+	for i, lp := range m.Label {
+		if i == at {
+			dst = appendGen(dst, sep, genLabel, gen)
+			sep = ','
+			if replace {
+				continue // the metric's own label of that name is the one replaced
+			}
+		}
 		dst = append(dst, sep)
 		dst = append(dst, lp.GetName()...)
 		dst = append(dst, '=', '"')
@@ -277,14 +293,42 @@ func buildLabels(dst []byte, m *dto.Metric, genLabel string, gen int64) ([]byte,
 		dst = append(dst, '"')
 		sep = ','
 	}
-	if genLabel != "" {
-		dst = append(dst, sep)
-		dst = append(dst, genLabel...)
-		dst = append(dst, '=', '"')
-		dst = strconv.AppendInt(dst, gen, 10)
-		dst = append(dst, '"')
+	if at == len(m.Label) {
+		dst = appendGen(dst, sep, genLabel, gen)
 	}
 	return dst, true
+}
+
+// genIndex says where the generation label belongs among a metric's own labels,
+// which Write hands out sorted by name, and whether one of that name is already
+// there and is to be replaced rather than inserted. Consumers that sort what
+// they receive -- VictoriaMetrics does -- then have nothing to move, and a
+// metric that happens to carry a label named like GenLabel does not go out
+// carrying it twice. An index of -1 means the generation is not wanted.
+func genIndex(labels []*dto.LabelPair, genLabel string) (int, bool) {
+	if genLabel == "" {
+		return -1, false
+	}
+	for i, lp := range labels {
+		switch name := lp.GetName(); {
+		case genLabel == name:
+			return i, true
+		case genLabel < name:
+			return i, false
+		}
+	}
+	return len(labels), false
+}
+
+func appendGen(dst []byte, sep byte, genLabel string, gen int64) []byte {
+	if genLabel == "" {
+		return dst
+	}
+	dst = append(dst, sep)
+	dst = append(dst, genLabel...)
+	dst = append(dst, '=', '"')
+	dst = strconv.AppendInt(dst, gen, 10)
+	return append(dst, '"')
 }
 
 // writeCached writes one metric from its cached labels and its family's shape.

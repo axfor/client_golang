@@ -178,7 +178,9 @@ func TestFallbackKeepsGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.Flush()
-	for _, want := range []string{`key="a",gen="1000"`, `key="b",gen="2000"`} {
+	// The generation goes in its sorted place among the metric's own labels, so
+	// a consumer that sorts what it receives has nothing to move.
+	for _, want := range []string{`gen="1000",key="a"`, `gen="2000",key="b"`} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("the fallback dropped %s:\n%s", want, out.String())
 		}
@@ -251,5 +253,47 @@ func TestSameBucketCountDifferentBoundsFallsBack(t *testing.T) {
 	}
 	if got.String() != want.String() {
 		t.Fatalf("output differs\n--- this encoder ---\n%s\n--- expfmt ---\n%s", got.String(), want.String())
+	}
+}
+
+// The generation label goes where it sorts among the metric's own labels, which
+// Write hands out sorted. VictoriaMetrics sorts every label set it ingests, so a
+// label appended past the end is one it has to move for every series of every
+// scrape. Both the cached encoder and the expfmt fallback place it the same way.
+func TestGenerationLabelIsSorted(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels []*dto.LabelPair
+		want   string
+	}{
+		{"before every label", []*dto.LabelPair{lp("key", "a"), lp("zone", "b")}, `{gen="7",key="a",zone="b"}`},
+		{"between two labels", []*dto.LabelPair{lp("app", "a"), lp("key", "b")}, `{app="a",gen="7",key="b"}`},
+		{"after every label", []*dto.LabelPair{lp("app", "a"), lp("be", "b")}, `{app="a",be="b",gen="7"}`},
+		{"no labels of its own", nil, `{gen="7"}`},
+		// A metric already carrying a label of that name has it replaced, not
+		// duplicated: two labels of one name is not a valid exposition.
+		{"replacing a label of the same name", []*dto.LabelPair{lp("app", "a"), lp("gen", "stale"), lp("key", "b")}, `{app="a",gen="7",key="b"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, path := range []string{"cached", "fallback"} {
+				m := &dto.Metric{Label: tc.labels, Counter: &dto.Counter{Value: proto.Float64(1)}}
+				if path == "fallback" {
+					// A sample carrying its own timestamp is not one this encoder writes.
+					m.TimestampMs = proto.Int64(1234)
+				}
+				mf := family("c_total", "", dto.MetricType_COUNTER, m)
+				var out bytes.Buffer
+				w := bufio.NewWriter(&out)
+				enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+				if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{{born: 7}}},
+					func(en *entry) int64 { return en.born }, map[string]*familyShape{}, "gen"); err != nil {
+					t.Fatal(err)
+				}
+				w.Flush()
+				if !strings.Contains(out.String(), tc.want) {
+					t.Errorf("%s path: want %s in\n%s", path, tc.want, out.String())
+				}
+			}
+		})
 	}
 }

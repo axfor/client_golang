@@ -415,9 +415,8 @@ func (e *Exposer) stamp(mf *dto.MetricFamily, m *dto.Metric, en *entry) {
 		// itself, so it is copied rather than appended to.
 		name, value := e.opts.GenLabel, strconv.FormatInt(gen, 10)
 		en.genPair = &dto.LabelPair{Name: &name, Value: &value}
-		labels := make([]*dto.LabelPair, len(m.Label), len(m.Label)+1)
-		copy(labels, m.Label)
-		en.genLabels = append(labels, en.genPair)
+		at, replace := genIndex(m.Label, name)
+		en.genLabels = withLabel(m.Label, en.genPair, at, replace)
 		en.genStamped = gen
 	} else if en.genStamped != gen {
 		value := strconv.FormatInt(gen, 10)
