@@ -186,11 +186,11 @@ type entry struct {
 	genStamped int64            // the generation genPair currently carries
 
 	// The rendered labels of this series, without the closing brace, plus the
-	// generation they were rendered under. See encode.go.
-	rendered    []byte
+	// generation they were rendered under. Shared with every other entry of the
+	// same instance, see encState.share.
+	rendered    string
 	renderedGen int64
-	num         []byte // reused buffer for formatting one value
-	basedOn     int64  // the generation the bases below belong to
+	basedOn     int64 // the generation the bases below belong to
 	baseValue   float64
 	baseSum     float64
 	baseCount   uint64

@@ -19,6 +19,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"unsafe"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -109,7 +110,7 @@ func TestEncodeMatchesExpfmt(t *testing.T) {
 			var got bytes.Buffer
 			w := bufio.NewWriter(&got)
 			enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
-			if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows}, func(*entry) int64 { return 0 }, map[string]*familyShape{}, ""); err != nil {
+			if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows}, func(*entry) int64 { return 0 }, newEncState(), ""); err != nil {
 				t.Fatal(err)
 			}
 			w.Flush()
@@ -133,7 +134,7 @@ func TestEncodeRebuildsOnGenerationChange(t *testing.T) {
 		&dto.Metric{Label: []*dto.LabelPair{lp("gen", "1000")}, Counter: &dto.Counter{Value: proto.Float64(1)}},
 	)
 	en := &entry{}
-	shapes := map[string]*familyShape{}
+	shapes := newEncState()
 	gen := int64(1000)
 
 	render := func() string {
@@ -174,7 +175,7 @@ func TestFallbackKeepsGeneration(t *testing.T) {
 	w := bufio.NewWriter(&out)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
-		func(en *entry) int64 { return en.born }, map[string]*familyShape{}, "gen"); err != nil {
+		func(en *entry) int64 { return en.born }, newEncState(), "gen"); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
@@ -207,7 +208,7 @@ func TestMismatchedBucketLayoutFallsBack(t *testing.T) {
 	w := bufio.NewWriter(&got)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
-		func(*entry) int64 { return 0 }, map[string]*familyShape{}, ""); err != nil {
+		func(*entry) int64 { return 0 }, newEncState(), ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
@@ -241,7 +242,7 @@ func TestSameBucketCountDifferentBoundsFallsBack(t *testing.T) {
 	w := bufio.NewWriter(&got)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
-		func(*entry) int64 { return 0 }, map[string]*familyShape{}, ""); err != nil {
+		func(*entry) int64 { return 0 }, newEncState(), ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
@@ -286,7 +287,7 @@ func TestGenerationLabelIsSorted(t *testing.T) {
 				w := bufio.NewWriter(&out)
 				enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 				if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{{born: 7}}},
-					func(en *entry) int64 { return en.born }, map[string]*familyShape{}, "gen"); err != nil {
+					func(en *entry) int64 { return en.born }, newEncState(), "gen"); err != nil {
 					t.Fatal(err)
 				}
 				w.Flush()
@@ -295,5 +296,40 @@ func TestGenerationLabelIsSorted(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Every family one instance appears in renders the same labels. Holding a copy
+// per entry was 15% of the heap of a sidecar with 30k keys, so entries built in
+// one scrape share the one string.
+func TestLabelsAreSharedBetweenFamilies(t *testing.T) {
+	labels := []*dto.LabelPair{lp("key", "a"), lp("zone", "b")}
+	mfs := []*dto.MetricFamily{
+		family("c_total", "", dto.MetricType_COUNTER,
+			&dto.Metric{Label: labels, Counter: &dto.Counter{Value: proto.Float64(1)}}),
+		family("d_total", "", dto.MetricType_COUNTER,
+			&dto.Metric{Label: labels, Counter: &dto.Counter{Value: proto.Float64(2)}}),
+	}
+	rows := [][]*entry{{{born: 7}}, {{born: 7}}}
+
+	var out bytes.Buffer
+	w := bufio.NewWriter(&out)
+	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+	es := newEncState()
+	if err := encodeFamilies(w, enc, mfs, rows, func(en *entry) int64 { return en.born }, es, "gen"); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+
+	a, b := rows[0][0].rendered, rows[1][0].rendered
+	if a != b || a == "" {
+		t.Fatalf("the two entries should hold equal labels: %q vs %q", a, b)
+	}
+	if unsafe.StringData(a) != unsafe.StringData(b) {
+		t.Errorf("the two entries hold separate copies of %q; they should share one", a)
+	}
+	// The table is scrape-scoped, so nothing accumulates across scrapes.
+	if len(es.intern) != 0 {
+		t.Errorf("the intern table should be empty after the scrape, has %d", len(es.intern))
 	}
 }

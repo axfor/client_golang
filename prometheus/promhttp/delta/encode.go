@@ -42,14 +42,44 @@ import (
 // timestamp, and names that are not valid legacy names, which the exposition
 // format escapes according to a negotiated scheme.
 
+// encState is what the cached encoder keeps between scrapes.
+type encState struct {
+	shapes map[string]*familyShape
+
+	// Every family an instance appears in renders the same labels: a key with 36
+	// metrics holds 36 copies of one string. Labels built during a scrape are
+	// shared through this table, which is cleared at the end of it -- an
+	// instance's entries are all created by the first write that touches it, so
+	// they are built together and nothing has to be swept later.
+	intern map[string]string
+
+	buf []byte // scratch for building one label string
+	num []byte // scratch for formatting one value
+}
+
+func newEncState() *encState {
+	return &encState{shapes: map[string]*familyShape{}, intern: map[string]string{}}
+}
+
+// share returns the one copy of b this scrape keeps.
+func (es *encState) share(b []byte) string {
+	if s, ok := es.intern[string(b)]; ok {
+		return s
+	}
+	s := string(b)
+	es.intern[s] = s
+	return s
+}
+
 // encodeFamilies writes the families of one scrape. rows[i] holds the entries
 // behind buf[i].Metric, in the same order, and carries the cached labels.
-func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, shapes map[string]*familyShape, genLabel string) error {
+func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, es *encState, genLabel string) error {
+	defer clear(es.intern)
 	for i, mf := range buf {
 		if len(mf.Metric) == 0 {
 			continue
 		}
-		sh := cacheLabels(mf, rows[i], gen, shapes, genLabel)
+		sh := cacheLabels(mf, rows[i], gen, es, genLabel)
 		if sh == nil {
 			// expfmt renders from the dto, so the generation has to go on it here.
 			// It cannot be decided earlier: whether this encoder takes a family is
@@ -62,7 +92,7 @@ func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily
 		}
 		writeFamilyHeader(w, mf)
 		for j, m := range mf.Metric {
-			if err := writeCached(w, sh, m, rows[i][j]); err != nil {
+			if err := writeCached(w, sh, m, rows[i][j], es); err != nil {
 				return err
 			}
 		}
@@ -153,7 +183,7 @@ func leFragment(v float64) []byte {
 
 // cacheLabels makes sure every entry of a family has its rendered labels, and
 // returns the shape the family writes with, or nil when expfmt has to take over.
-func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, shapes map[string]*familyShape, genLabel string) *familyShape {
+func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es *encState, genLabel string) *familyShape {
 	if len(rows) != len(mf.Metric) || !handled(mf) {
 		return nil
 	}
@@ -174,7 +204,7 @@ func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, sh
 			return nil
 		}
 		if sh == nil {
-			sh = shapeOf(mf, m, shapes)
+			sh = shapeOf(mf, m, es.shapes)
 		} else if !sh.fits(m) {
 			// The shape carries the le fragments of the family's bucket layout.
 			// A metric with a different layout would be written against the wrong
@@ -182,14 +212,15 @@ func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, sh
 			return nil
 		}
 		g := gen(en)
-		if en.rendered != nil && en.renderedGen == g {
+		if en.rendered != "" && en.renderedGen == g {
 			continue
 		}
-		rendered, ok := buildLabels(en.rendered[:0], m, genLabel, g)
+		rendered, ok := buildLabels(es.buf[:0], m, genLabel, g)
 		if !ok {
 			return nil
 		}
-		en.rendered, en.renderedGen = rendered, g
+		es.buf = rendered // keep the grown scratch
+		en.rendered, en.renderedGen = es.share(rendered), g
 	}
 	return sh
 }
@@ -335,7 +366,7 @@ func appendGen(dst []byte, sep byte, genLabel string, gen int64) []byte {
 //
 // A series with no labels needs the braces opened by the le fragment instead of
 // by the labels, which is the only place the two cases differ.
-func writeCached(w *bufio.Writer, sh *familyShape, m *dto.Metric, en *entry) error {
+func writeCached(w *bufio.Writer, sh *familyShape, m *dto.Metric, en *entry, es *encState) error {
 	plain := closeBrace
 	if len(en.rendered) == 0 {
 		plain = plain[1:] // no labels, so no braces to close
@@ -344,7 +375,7 @@ func writeCached(w *bufio.Writer, sh *familyShape, m *dto.Metric, en *entry) err
 		if _, err := w.Write(name); err != nil {
 			return err
 		}
-		if _, err := w.Write(en.rendered); err != nil {
+		if _, err := w.WriteString(en.rendered); err != nil {
 			return err
 		}
 		if len(en.rendered) == 0 && len(tail) > 0 && tail[0] == ',' {
@@ -356,8 +387,8 @@ func writeCached(w *bufio.Writer, sh *familyShape, m *dto.Metric, en *entry) err
 		if _, err := w.Write(tail); err != nil {
 			return err
 		}
-		en.num = appendFloat(en.num[:0], v) // kept, or the buffer is reallocated every value
-		if _, err := w.Write(en.num); err != nil {
+		es.num = appendFloat(es.num[:0], v) // kept, or the buffer is reallocated every value
+		if _, err := w.Write(es.num); err != nil {
 			return err
 		}
 		return w.WriteByte('\n')
