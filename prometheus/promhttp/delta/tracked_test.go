@@ -359,3 +359,34 @@ func TestIdleGaugeIsNotToppedUpWhileBeingDropped(t *testing.T) {
 		t.Errorf("the non-zero gauge should survive and keep being reported: got %v (present %v)", v, ok)
 	}
 }
+
+// What a long scrape outage does to a series that was written once and then
+// went quiet. The round counter advances on every attempt, delivered or not,
+// and idle cleanup runs whether or not the response got out, so a series can
+// age out while the increment it is holding has never been delivered.
+//
+// This is not about the outage being survivable -- an outage longer than
+// IdleScrapes is already outside what the design promises -- but about which
+// way it fails: silently losing the increment, or keeping it.
+func TestOutageLongerThanIdleScrapes(t *testing.T) {
+	f := newTrackedFixture(t, Options{
+		ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 3, HeartbeatScrapes: 1,
+	})
+	f.c.WithLabelValues("a").Add(5)
+
+	// Every scrape fails, for longer than the idle threshold.
+	var deleted int
+	for range 6 {
+		_, st := f.scrape(t, true)
+		if st.Delivered {
+			t.Fatal("the scrape should not have been delivered")
+		}
+		deleted += st.Deleted
+	}
+
+	got, _ := f.scrape(t, false)
+	t.Logf("dropped during the outage: %d; first delivered scrape after it: %v", deleted, got)
+	if got[`c_total{key=a}`] != 5 {
+		t.Errorf("the 5 written before the outage was lost: got %v, want c_total{key=a}=5", got)
+	}
+}
