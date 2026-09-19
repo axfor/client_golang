@@ -167,10 +167,6 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 // take writes one instance into a dto, works out the value to report, and puts
 // it in this scrape's family.
 func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingCommit, bool) {
-	e.scratch.Reset()
-	if err := m.Write(&e.scratch); err != nil {
-		return nil, false
-	}
 	desc := m.Desc()
 	en := e.state[m]
 	if en == nil {
@@ -179,12 +175,20 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 	}
 	en.lastRound = e.round
 
+	// Write into the instance's own dto rather than a shared scratch: a dto that
+	// a previous Write already filled in is updated in place, so a steady-state
+	// scrape allocates nothing here. The first time there is nothing to update,
+	// so it goes through the scratch and keeps a copy.
 	out := en.out
 	if out == nil {
-		out = cloneMetric(&e.scratch) // built once per instance, reused every scrape
+		e.scratch.Reset()
+		if err := m.Write(&e.scratch); err != nil {
+			return nil, false
+		}
+		out = cloneMetric(&e.scratch)
 		en.out = out
-	} else {
-		refillMetric(out, &e.scratch)
+	} else if err := m.Write(out); err != nil {
+		return nil, false
 	}
 	mf := e.family(desc, out)
 	if mf == nil {
@@ -277,29 +281,6 @@ func metricType(m *dto.Metric) *dto.MetricType {
 		return nil
 	}
 	return &t
-}
-
-// refillMetric copies the values from scratch into an existing dto instead of
-// allocating one per scrape. Labels never change, so they are left alone.
-func refillMetric(dst, src *dto.Metric) {
-	switch {
-	case src.Counter != nil && dst.Counter != nil:
-		*dst.Counter.Value = src.Counter.GetValue()
-	case src.Gauge != nil && dst.Gauge != nil:
-		*dst.Gauge.Value = src.Gauge.GetValue()
-	case src.Histogram != nil && dst.Histogram != nil:
-		*dst.Histogram.SampleSum = src.Histogram.GetSampleSum()
-		*dst.Histogram.SampleCount = src.Histogram.GetSampleCount()
-		for i, b := range src.Histogram.Bucket {
-			if i < len(dst.Histogram.Bucket) {
-				*dst.Histogram.Bucket[i].CumulativeCount = b.GetCumulativeCount()
-			}
-		}
-	case src.Untyped != nil && dst.Untyped != nil:
-		*dst.Untyped.Value = src.Untyped.GetValue()
-	case src.Summary != nil:
-		dst.Summary = src.Summary
-	}
 }
 
 // cloneMetric copies what is in scratch: scratch is reused for every instance,

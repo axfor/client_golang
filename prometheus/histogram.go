@@ -785,6 +785,58 @@ func (h *histogram) ObserveWithExemplar(v float64, e Labels) {
 	h.updateExemplar(v, i, e)
 }
 
+// refill updates a dto.Metric a previous Write already filled in, instead of
+// building a new one. It reports whether it did.
+//
+// Writing a classic histogram allocates a dto.Histogram, a bucket slice and
+// three values per bucket, which for a process exposing many histograms is the
+// bulk of what a scrape allocates. A caller that keeps one dto.Metric per
+// instance and writes into it every scrape pays none of it.
+//
+// Only the plain case is reused: a classic histogram whose bucket layout is
+// unchanged and which has no exemplar on +Inf, since that one adds a bucket.
+// Anything else falls through to building a fresh dto.
+//
+// Note for callers that reuse a dto.Metric: the values are updated in place, so
+// anything read from a previous Write of the same dto is no longer valid.
+func (h *histogram) refill(out *dto.Metric, count uint64, sum float64, coldCounts *histogramCounts) bool {
+	his := out.Histogram
+	if his == nil || his.SampleCount == nil || his.SampleSum == nil || len(his.Bucket) != len(h.upperBounds) {
+		return false
+	}
+	if h.nativeHistogramSchema > math.MinInt32 || len(his.PositiveSpan) > 0 || len(his.NegativeSpan) > 0 {
+		return false
+	}
+	if h.exemplars[len(h.upperBounds)].Load() != nil {
+		return false
+	}
+	for i, upperBound := range h.upperBounds {
+		b := his.Bucket[i]
+		if b == nil || b.CumulativeCount == nil || b.GetUpperBound() != upperBound {
+			return false
+		}
+	}
+
+	*his.SampleCount = count
+	*his.SampleSum = sum
+	if ct := his.CreatedTimestamp; ct != nil {
+		ct.Seconds = h.lastResetTime.Unix()
+		ct.Nanos = int32(h.lastResetTime.Nanosecond())
+	} else {
+		his.CreatedTimestamp = timestamppb.New(h.lastResetTime)
+	}
+	var cumCount uint64
+	for i := range h.upperBounds {
+		cumCount += atomic.LoadUint64(&coldCounts.buckets[i])
+		*his.Bucket[i].CumulativeCount = cumCount
+		if e := h.exemplars[i].Load(); e != nil {
+			his.Bucket[i].Exemplar = e.(*dto.Exemplar)
+		}
+	}
+	out.Label = h.labelPairs
+	return true
+}
+
 func (h *histogram) Write(out *dto.Metric) error {
 	// For simplicity, we protect this whole method by a mutex. It is not in
 	// the hot path, i.e. Observe is called much more often than Write. The
@@ -806,10 +858,16 @@ func (h *histogram) Write(out *dto.Metric) error {
 
 	waitForCooldown(count, coldCounts)
 
+	sum := math.Float64frombits(atomic.LoadUint64(&coldCounts.sumBits))
+	if h.refill(out, count, sum, coldCounts) {
+		addAndResetCounts(hotCounts, coldCounts)
+		return nil
+	}
+
 	his := &dto.Histogram{
 		Bucket:           make([]*dto.Bucket, len(h.upperBounds)),
 		SampleCount:      proto.Uint64(count),
-		SampleSum:        proto.Float64(math.Float64frombits(atomic.LoadUint64(&coldCounts.sumBits))),
+		SampleSum:        proto.Float64(sum),
 		CreatedTimestamp: timestamppb.New(h.lastResetTime),
 	}
 	out.Histogram = his

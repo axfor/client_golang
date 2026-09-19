@@ -44,6 +44,7 @@ package delta
 import (
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -177,8 +178,11 @@ type entry struct {
 	changed   uint64            // last scrape whose value differed from the delivered one
 	lastRound uint64            // last scrape this was seen in
 
-	born        int64 // creation time in Unix seconds, the value of GenLabel
-	basedOn     int64 // the generation the bases below belong to
+	born        int64            // creation time in Unix seconds, the value of GenLabel
+	genPair     *dto.LabelPair   // the generation label, updated in place
+	genLabels   []*dto.LabelPair // the labels with the generation appended, built once
+	genStamped  int64            // the generation genPair currently carries
+	basedOn     int64            // the generation the bases below belong to
 	baseValue   float64
 	baseSum     float64
 	baseCount   uint64
@@ -390,7 +394,24 @@ func (e *Exposer) stamp(m *dto.Metric, en *entry) {
 	if e.opts.GenLabel == "" {
 		return
 	}
-	applyGen(m, e.opts.GenLabel, e.rb.genOf(en))
+	gen := e.rb.genOf(en)
+	if en.genPair == nil {
+		// Built once. The label slice handed out by Write belongs to the metric
+		// itself, so it is copied rather than appended to.
+		name, value := e.opts.GenLabel, strconv.FormatInt(gen, 10)
+		en.genPair = &dto.LabelPair{Name: &name, Value: &value}
+		labels := make([]*dto.LabelPair, len(m.Label), len(m.Label)+1)
+		copy(labels, m.Label)
+		en.genLabels = append(labels, en.genPair)
+		en.genStamped = gen
+	} else if en.genStamped != gen {
+		value := strconv.FormatInt(gen, 10)
+		en.genPair.Value = &value
+		en.genStamped = gen
+	}
+	// Write resets the labels to the metric's own every scrape, so put the
+	// stamped set back.
+	m.Label = en.genLabels
 }
 
 // deletable reports whether an idle series may be dropped.

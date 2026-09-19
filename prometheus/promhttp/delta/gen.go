@@ -14,10 +14,7 @@
 package delta
 
 import (
-	"strconv"
 	"time"
-
-	dto "github.com/prometheus/client_model/go"
 )
 
 // The generation label and the RebaseAfterGap bookkeeping.
@@ -108,23 +105,4 @@ func (en *entry) baseBucket(i int) uint64 {
 		return en.baseBuckets[i]
 	}
 	return 0
-}
-
-// applyGen puts the generation label on a metric, adding it the first time and
-// updating it afterwards. The label slice may be owned by the metric itself, so
-// it is copied rather than appended to.
-func applyGen(m *dto.Metric, name string, gen int64) {
-	v := strconv.FormatInt(gen, 10)
-	for _, lp := range m.Label {
-		if lp.GetName() == name {
-			if lp.GetValue() != v {
-				lp.Value = &v
-			}
-			return
-		}
-	}
-	labels := make([]*dto.LabelPair, len(m.Label), len(m.Label)+1)
-	copy(labels, m.Label)
-	n := name
-	m.Label = append(labels, &dto.LabelPair{Name: &n, Value: &v})
 }

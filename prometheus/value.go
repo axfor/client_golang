@@ -194,12 +194,29 @@ func populateMetric(
 	ct *timestamppb.Timestamp,
 ) error {
 	m.Label = labelPairs
+	// A dto a previous Write already filled in is updated in place. A caller that
+	// keeps one dto.Metric per instance and writes into it every scrape then
+	// allocates nothing here; a caller passing a fresh dto, as Gather does, takes
+	// the allocating path as before. Values are updated in place, so anything read
+	// from a previous Write of the same dto is no longer valid.
 	switch t {
 	case CounterValue:
+		if c := m.Counter; c != nil && c.Value != nil {
+			*c.Value, c.Exemplar, c.CreatedTimestamp = v, e, ct
+			return nil
+		}
 		m.Counter = &dto.Counter{Value: proto.Float64(v), Exemplar: e, CreatedTimestamp: ct}
 	case GaugeValue:
+		if g := m.Gauge; g != nil && g.Value != nil {
+			*g.Value = v
+			return nil
+		}
 		m.Gauge = &dto.Gauge{Value: proto.Float64(v)}
 	case UntypedValue:
+		if u := m.Untyped; u != nil && u.Value != nil {
+			*u.Value = v
+			return nil
+		}
 		m.Untyped = &dto.Untyped{Value: proto.Float64(v)}
 	default:
 		return fmt.Errorf("encountered unknown type %v", t)
