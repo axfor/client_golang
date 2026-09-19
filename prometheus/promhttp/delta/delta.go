@@ -178,15 +178,22 @@ type entry struct {
 	changed   uint64            // last scrape whose value differed from the delivered one
 	lastRound uint64            // last scrape this was seen in
 
-	born        int64            // creation time in Unix seconds, the value of GenLabel
-	genPair     *dto.LabelPair   // the generation label, updated in place
-	genLabels   []*dto.LabelPair // the labels with the generation appended, built once
-	genStamped  int64            // the generation genPair currently carries
-	basedOn     int64            // the generation the bases below belong to
-	baseValue   float64
-	baseSum     float64
-	baseCount   uint64
-	baseBuckets []uint64
+	born       int64            // creation time in Unix seconds, the value of GenLabel
+	genPair    *dto.LabelPair   // the generation label, updated in place
+	genLabels  []*dto.LabelPair // the labels with the generation appended, built once
+	genStamped int64            // the generation genPair currently carries
+
+	// Cached text-exposition prefixes: the bytes to the left of the value of
+	// every sample line this series produces. See encode.go.
+	lines        [][]byte
+	linesGen     int64
+	linesBuckets int
+	num          []byte // reused buffer for formatting one value
+	basedOn      int64  // the generation the bases below belong to
+	baseValue    float64
+	baseSum      float64
+	baseCount    uint64
+	baseBuckets  []uint64
 }
 
 // New returns an Exposer reading from g.

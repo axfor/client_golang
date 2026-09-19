@@ -55,8 +55,9 @@ type TrackedExposer struct {
 	state   map[prometheus.Metric]*entry
 	scratch dto.Metric
 	buf     []*dto.MetricFamily
+	rows    [][]*entry // rows[i] are the entries behind buf[i].Metric, in order
 	taken   []prometheus.Metric
-	byName  map[string]*dto.MetricFamily
+	byName  map[string]int // family name to its index in buf
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -71,7 +72,7 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 		opts:    opts,
 		tracker: t,
 		state:   map[prometheus.Metric]*entry{},
-		byName:  map[string]*dto.MetricFamily{},
+		byName:  map[string]int{},
 	}
 }
 
@@ -90,6 +91,9 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	st.Round = e.round
 	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
 
+	for i := range e.rows {
+		e.rows[i] = e.rows[i][:0]
+	}
 	e.buf = e.buf[:0]
 	clear(e.byName)
 	var pending []pendingCommit
@@ -140,12 +144,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
-	for _, mf := range e.buf {
-		if err := enc.Encode(mf); err != nil {
-			st.Err = err
-			break
-		}
-	}
+	st.Err = encodeFamilies(rs.w, enc, e.buf, e.rows, e.rb.genOf)
 	st.Err, st.Delivered = rs.close(st.Err, r)
 
 	if st.Delivered {
@@ -190,7 +189,7 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 	} else if err := m.Write(out); err != nil {
 		return nil, false
 	}
-	mf := e.family(desc, out)
+	mf, idx := e.family(desc, out, en)
 	if mf == nil {
 		return nil, false
 	}
@@ -207,27 +206,36 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 		// unchanged, e.g. added and subtracted again within one scrape: skip it,
 		// without affecting the next scrape
 		mf.Metric = mf.Metric[:len(mf.Metric)-1]
+		e.rows[idx] = e.rows[idx][:len(e.rows[idx])-1]
 		return pc, true
 	}
 	return pc, true
 }
 
-// family finds or creates the metric family this instance belongs to and adds it.
-func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric) *dto.MetricFamily {
+// family finds or creates the metric family this instance belongs to, adds it,
+// and returns the family together with its index, which the caller needs to
+// keep the parallel entry rows in step.
+func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric, en *entry) (*dto.MetricFamily, int) {
 	name := desc.Name()
-	mf := e.byName[name]
-	if mf == nil {
+	idx, ok := e.byName[name]
+	if !ok {
 		typ := metricType(m)
 		if typ == nil {
-			return nil
+			return nil, 0
 		}
 		help := desc.Help()
-		mf = &dto.MetricFamily{Name: &name, Help: &help, Type: typ}
-		e.byName[name] = mf
-		e.buf = append(e.buf, mf)
+		idx = len(e.buf)
+		e.buf = append(e.buf, &dto.MetricFamily{Name: &name, Help: &help, Type: typ})
+		if idx == len(e.rows) {
+			e.rows = append(e.rows, nil)
+		}
+		e.rows[idx] = e.rows[idx][:0]
+		e.byName[name] = idx
 	}
+	mf := e.buf[idx]
 	mf.Metric = append(mf.Metric, m)
-	return mf
+	e.rows[idx] = append(e.rows[idx], en)
+	return mf, idx
 }
 
 // decide reuses Exposer's change-only and delta logic.
