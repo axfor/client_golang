@@ -96,8 +96,9 @@ func (f *trackedFixture) scrape(t *testing.T, fail bool) (map[string]float64, Sc
 	return out, st
 }
 
-// Delta mode reports only the instances written this scrape, carrying what
-// accrued since the last delivered one.
+// Delta mode reports the counters and histograms written this scrape, carrying
+// what accrued since the last delivered one. Gauges ride along every scrape,
+// written or not, because a current value cannot be accumulated.
 func TestTrackedReportIncrements(t *testing.T) {
 	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true})
 	f.c.WithLabelValues("a").Add(5)
@@ -112,13 +113,13 @@ func TestTrackedReportIncrements(t *testing.T) {
 
 	f.c.WithLabelValues("a").Add(2)
 	m, _ = f.scrape(t, false)
-	if m[`c_total{key=a}`] != 2 || len(m) != 1 {
-		t.Fatalf("scrape 2 wrote only the counter and should report its increment of 2: %v", m)
+	if m[`c_total{key=a}`] != 2 || m[`g{key=a}`] != 9 || len(m) != 2 {
+		t.Fatalf("scrape 2 wrote only the counter: want its increment of 2 plus the gauge, got %v", m)
 	}
 
 	m, st = f.scrape(t, false)
-	if len(m) != 0 || st.Samples != 0 {
-		t.Fatalf("a scrape with no writes should report nothing: %v (%+v)", m, st)
+	if len(m) != 1 || m[`g{key=a}`] != 9 || st.Samples != 1 {
+		t.Fatalf("a scrape with no writes should report the gauge and nothing else: %v (%+v)", m, st)
 	}
 }
 
@@ -292,5 +293,69 @@ func TestTrackedIdleDeletionCallback(t *testing.T) {
 		if !strings.HasSuffix(g, "/a") {
 			t.Fatalf("callback got an unexpected series: %v", got)
 		}
+	}
+}
+
+// A gauge is a current value, not something that accumulates, so a scrape that
+// left it out would leave the consumer with a gap rather than a saving. Every
+// gauge is reported every scrape, whether or not it was written and whether or
+// not heartbeats are on. Counters and histograms stay change-only.
+func TestGaugesAreAlwaysReported(t *testing.T) {
+	f := newTrackedFixture(t, Options{DisableHeartbeat: true, ReportIncrements: true})
+	for _, key := range []string{"a", "b", "c"} {
+		f.c.WithLabelValues(key).Inc()
+		f.g.WithLabelValues(key).Set(7)
+	}
+	if got, _ := f.scrape(t, false); len(got) != 6 {
+		t.Fatalf("first scrape: got %d series, want 6: %v", len(got), got)
+	}
+
+	// Only "a" moves. Its counter increment is reported; b and c contribute no
+	// counter at all, but all three gauges have to be there.
+	f.c.WithLabelValues("a").Inc()
+	f.g.WithLabelValues("a").Set(9)
+	got, st := f.scrape(t, false)
+	want := map[string]float64{"a": 9, "b": 7, "c": 7}
+	for key, w := range want {
+		if v, ok := got["g{key="+key+"}"]; !ok || v != w {
+			t.Errorf("gauge for key %q: got %v (present %v), want %v", key, v, ok, w)
+		}
+	}
+	if _, ok := got["c_total{key=b}"]; ok {
+		t.Errorf("unchanged counter for key b was reported: %v", got)
+	}
+	if st.Gauges != 2 {
+		t.Errorf("Gauges = %d, want 2 (b and c topped up; a came off the dirty list)", st.Gauges)
+	}
+}
+
+// A gauge that is idle at zero is still deleted, and is not reported one last
+// time on the way out.
+func TestIdleGaugeIsNotToppedUpWhileBeingDropped(t *testing.T) {
+	f := newTrackedFixture(t, Options{DisableHeartbeat: true, ReportIncrements: true, IdleScrapes: 2, HeartbeatScrapes: 1})
+	f.g.WithLabelValues("a").Set(0)
+	f.g.WithLabelValues("b").Set(5)
+	f.scrape(t, false)
+
+	var deleted int
+	var last map[string]float64
+	for range 4 {
+		var st ScrapeStats
+		last, st = f.scrape(t, false)
+		deleted += st.Deleted
+		if st.Deleted > 0 {
+			if _, ok := last["g{key=a}"]; ok {
+				t.Errorf("the dropped gauge was reported on the scrape that dropped it: %v", last)
+			}
+		}
+	}
+	if deleted == 0 {
+		t.Fatalf("the idle zero gauge was never dropped")
+	}
+	if _, ok := last["g{key=a}"]; ok {
+		t.Errorf("the dropped gauge came back after deletion: %v", last)
+	}
+	if v, ok := last["g{key=b}"]; !ok || v != 5 {
+		t.Errorf("the non-zero gauge should survive and keep being reported: got %v (present %v)", v, ok)
 	}
 }

@@ -57,7 +57,8 @@ type TrackedExposer struct {
 	buf     []*dto.MetricFamily
 	rows    [][]*entry // rows[i] are the entries behind buf[i].Metric, in order
 	taken   []prometheus.Metric
-	byName  map[string]int // family name to its index in buf
+	gauges  []prometheus.Metric // every gauge seen, walked in full every scrape
+	byName  map[string]int      // family name to its index in buf
 	shapes  map[string]*familyShape
 }
 
@@ -125,6 +126,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 			if e.opts.IdleScrapes > 0 && e.round-en.changed > uint64(e.opts.IdleScrapes) && deletable(en) {
 				idle = append(idle, en)
 				en.metric = m
+				en.lastRound = e.round // handled this scrape: do not also top it up below
 				return
 			}
 			if !e.opts.DisableHeartbeat && en.lastRound != e.round {
@@ -137,6 +139,30 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 				}
 			}
 		})
+	}
+
+	// Gauges are current values: one left out is a gap for the consumer, not a
+	// saving, so every gauge goes out every scrape regardless of DisableHeartbeat.
+	// This is what the Gather path does too, see Exposer.decide.
+	for i := 0; i < len(e.gauges); {
+		m := e.gauges[i]
+		en := e.state[m]
+		if en == nil { // dropped as idle; a new child registers itself again
+			e.gauges[i] = e.gauges[len(e.gauges)-1]
+			e.gauges[len(e.gauges)-1] = nil
+			e.gauges = e.gauges[:len(e.gauges)-1]
+			continue
+		}
+		if en.lastRound != e.round {
+			if pc, ok := e.take(m, true); ok {
+				st.Gauges++
+				taken = append(taken, m)
+				if pc != nil {
+					pending = append(pending, *pc)
+				}
+			}
+		}
+		i++
 	}
 
 	for _, mf := range e.buf {
@@ -170,7 +196,8 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingCommit, bool) {
 	desc := m.Desc()
 	en := e.state[m]
-	if en == nil {
+	fresh := en == nil
+	if fresh {
 		en = &entry{family: desc.Name(), changed: e.round, born: e.rb.clock().Unix()}
 		e.state[m] = en
 	}
@@ -196,6 +223,12 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 		return nil, false
 	}
 	en.kind = mf.GetType()
+	if fresh && en.kind == dto.MetricType_GAUGE {
+		// Gauges are reported in full every scrape, which the bucketed walk over
+		// the tracker cannot do, so they get a list of their own. Entries dropped
+		// as idle are pruned from it lazily in Serve.
+		e.gauges = append(e.gauges, m)
+	}
 	// Capture the labels before decide stamps the generation on them: they are
 	// handed to Options.Delete, which looks the child up in its Vec, and the Vec
 	// has no generation label. Only needed when there is a callback; without one

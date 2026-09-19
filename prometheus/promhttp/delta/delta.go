@@ -146,6 +146,7 @@ type ScrapeStats struct {
 	Families  int    // metric families written
 	Samples   int    // series written
 	Heartbeat int    // of those, how many were heartbeat top-ups
+	Gauges    int    // of those, how many were gauges reported unchanged
 	Deleted   int    // idle series dropped this scrape
 	Rebased   bool   // the gap since the last delivery exceeded RebaseAfterGap, so the generation moved
 	Delivered bool   // response fully written and the request not cancelled
