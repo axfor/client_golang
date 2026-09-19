@@ -58,6 +58,7 @@ type TrackedExposer struct {
 	rows    [][]*entry // rows[i] are the entries behind buf[i].Metric, in order
 	taken   []prometheus.Metric
 	byName  map[string]int // family name to its index in buf
+	shapes  map[string]*familyShape
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -73,6 +74,7 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 		tracker: t,
 		state:   map[prometheus.Metric]*entry{},
 		byName:  map[string]int{},
+		shapes:  map[string]*familyShape{},
 	}
 }
 
@@ -144,7 +146,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
-	st.Err = encodeFamilies(rs.w, enc, e.buf, e.rows, e.rb.genOf)
+	st.Err = encodeFamilies(rs.w, enc, e.buf, e.rows, e.rb.genOf, e.shapes, e.opts.GenLabel)
 	st.Err, st.Delivered = rs.close(st.Err, r)
 
 	if st.Delivered {
@@ -240,7 +242,7 @@ func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric, en *entry)
 
 // decide reuses Exposer's change-only and delta logic.
 func (e *TrackedExposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, bool, *pendingCommit) {
-	shim := &Exposer{opts: e.opts, round: e.round, rb: e.rb}
+	shim := &Exposer{opts: e.opts, round: e.round, rb: e.rb, cached: true}
 	return shim.decide(mf, m, en)
 }
 

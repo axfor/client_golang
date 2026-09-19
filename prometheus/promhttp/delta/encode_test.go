@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"math"
+	"strings"
 	"testing"
 
 	dto "github.com/prometheus/client_model/go"
@@ -108,7 +109,7 @@ func TestEncodeMatchesExpfmt(t *testing.T) {
 			var got bytes.Buffer
 			w := bufio.NewWriter(&got)
 			enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
-			if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows}, func(*entry) int64 { return 0 }); err != nil {
+			if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows}, func(*entry) int64 { return 0 }, map[string]*familyShape{}, ""); err != nil {
 				t.Fatal(err)
 			}
 			w.Flush()
@@ -132,13 +133,14 @@ func TestEncodeRebuildsOnGenerationChange(t *testing.T) {
 		&dto.Metric{Label: []*dto.LabelPair{lp("gen", "1000")}, Counter: &dto.Counter{Value: proto.Float64(1)}},
 	)
 	en := &entry{}
+	shapes := map[string]*familyShape{}
 	gen := int64(1000)
 
 	render := func() string {
 		var out bytes.Buffer
 		w := bufio.NewWriter(&out)
 		enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
-		if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{en}}, func(*entry) int64 { return gen }); err != nil {
+		if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{en}}, func(*entry) int64 { return gen }, shapes, "gen"); err != nil {
 			t.Fatal(err)
 		}
 		w.Flush()
@@ -153,5 +155,101 @@ func TestEncodeRebuildsOnGenerationChange(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(second), []byte(`gen="2000"`)) {
 		t.Fatalf("the new generation should be in the output:\n%s", second)
+	}
+}
+
+// A family this encoder cannot take goes to expfmt, which renders from the dto,
+// so the generation has to be put there before it does. Whether the encoder
+// takes a family is only known once every metric of it is in, so a metric that
+// forces the fallback -- here one carrying its own timestamp -- must not leave
+// the others in the family without their generation.
+func TestFallbackKeepsGeneration(t *testing.T) {
+	mf := family("c_total", "", dto.MetricType_COUNTER,
+		&dto.Metric{Label: []*dto.LabelPair{lp("key", "a")}, Counter: &dto.Counter{Value: proto.Float64(1)}},
+		&dto.Metric{Label: []*dto.LabelPair{lp("key", "b")}, Counter: &dto.Counter{Value: proto.Float64(2)}, TimestampMs: proto.Int64(1234)},
+	)
+	rows := []*entry{{born: 1000}, {born: 2000}}
+
+	var out bytes.Buffer
+	w := bufio.NewWriter(&out)
+	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
+		func(en *entry) int64 { return en.born }, map[string]*familyShape{}, "gen"); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+	for _, want := range []string{`key="a",gen="1000"`, `key="b",gen="2000"`} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("the fallback dropped %s:\n%s", want, out.String())
+		}
+	}
+}
+
+// The family shape carries the le fragments of one bucket layout. A family whose
+// metrics disagree on the layout has to go to expfmt rather than be written
+// against the wrong bounds.
+func TestMismatchedBucketLayoutFallsBack(t *testing.T) {
+	mf := family("h", "", dto.MetricType_HISTOGRAM,
+		&dto.Metric{Label: []*dto.LabelPair{lp("key", "a")}, Histogram: &dto.Histogram{
+			SampleCount: proto.Uint64(2), SampleSum: proto.Float64(3),
+			Bucket: []*dto.Bucket{bucket(5, 1), bucket(10, 2)},
+		}},
+		&dto.Metric{Label: []*dto.LabelPair{lp("key", "b")}, Histogram: &dto.Histogram{
+			SampleCount: proto.Uint64(3), SampleSum: proto.Float64(9),
+			Bucket: []*dto.Bucket{bucket(1, 1), bucket(2, 2), bucket(4, 3)},
+		}},
+	)
+	rows := []*entry{{}, {}}
+
+	var got bytes.Buffer
+	w := bufio.NewWriter(&got)
+	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
+		func(*entry) int64 { return 0 }, map[string]*familyShape{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+
+	var want bytes.Buffer
+	ref := expfmt.NewEncoder(&want, expfmt.NewFormat(expfmt.TypeTextPlain))
+	if err := ref.Encode(mf); err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("output differs\n--- this encoder ---\n%s\n--- expfmt ---\n%s", got.String(), want.String())
+	}
+}
+
+// Same number of buckets, different bounds: the le of one would be written
+// against the other's values, which looks well formed and is wrong.
+func TestSameBucketCountDifferentBoundsFallsBack(t *testing.T) {
+	mf := family("h3", "", dto.MetricType_HISTOGRAM,
+		&dto.Metric{Label: []*dto.LabelPair{lp("key", "a")}, Histogram: &dto.Histogram{
+			SampleCount: proto.Uint64(2), SampleSum: proto.Float64(3),
+			Bucket: []*dto.Bucket{bucket(5, 1), bucket(10, 2)},
+		}},
+		&dto.Metric{Label: []*dto.LabelPair{lp("key", "b")}, Histogram: &dto.Histogram{
+			SampleCount: proto.Uint64(2), SampleSum: proto.Float64(3),
+			Bucket: []*dto.Bucket{bucket(1, 1), bucket(2, 2)},
+		}},
+	)
+	rows := []*entry{{}, {}}
+
+	var got bytes.Buffer
+	w := bufio.NewWriter(&got)
+	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
+		func(*entry) int64 { return 0 }, map[string]*familyShape{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+
+	var want bytes.Buffer
+	ref := expfmt.NewEncoder(&want, expfmt.NewFormat(expfmt.TypeTextPlain))
+	if err := ref.Encode(mf); err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("output differs\n--- this encoder ---\n%s\n--- expfmt ---\n%s", got.String(), want.String())
 	}
 }

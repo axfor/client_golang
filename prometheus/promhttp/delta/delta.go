@@ -154,9 +154,10 @@ type ScrapeStats struct {
 
 // Exposer holds the last delivered values and the idle counters.
 type Exposer struct {
-	g    prometheus.Gatherer
-	opts Options
-	rb   rebaseState
+	g      prometheus.Gatherer
+	opts   Options
+	rb     rebaseState
+	cached bool // the caller writes through the cached encoder, not expfmt
 
 	mu     sync.Mutex
 	round  uint64
@@ -183,17 +184,16 @@ type entry struct {
 	genLabels  []*dto.LabelPair // the labels with the generation appended, built once
 	genStamped int64            // the generation genPair currently carries
 
-	// Cached text-exposition prefixes: the bytes to the left of the value of
-	// every sample line this series produces. See encode.go.
-	lines        [][]byte
-	linesGen     int64
-	linesBuckets int
-	num          []byte // reused buffer for formatting one value
-	basedOn      int64  // the generation the bases below belong to
-	baseValue    float64
-	baseSum      float64
-	baseCount    uint64
-	baseBuckets  []uint64
+	// The rendered labels of this series, without the closing brace, plus the
+	// generation they were rendered under. See encode.go.
+	rendered    []byte
+	renderedGen int64
+	num         []byte // reused buffer for formatting one value
+	basedOn     int64  // the generation the bases below belong to
+	baseValue   float64
+	baseSum     float64
+	baseCount   uint64
+	baseBuckets []uint64
 }
 
 // New returns an Exposer reading from g.
@@ -334,7 +334,7 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		} else if e.rb.gen != 0 {
 			*m.Counter.Value = cur - en.baseValue
 		}
-		e.stamp(m, en)
+		e.stamp(mf, m, en)
 		return true, !changed, &pendingCommit{en: en, value: cur}
 
 	case dto.MetricType_HISTOGRAM:
@@ -377,7 +377,7 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 				*b.CumulativeCount = b.GetCumulativeCount() - en.baseBucket(i)
 			}
 		}
-		e.stamp(m, en)
+		e.stamp(mf, m, en)
 		return true, !changed, &pendingCommit{en: en, sum: sum, count: count, buckets: buckets}
 
 	case dto.MetricType_GAUGE:
@@ -397,8 +397,15 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 
 // stamp puts the generation label on a counter or histogram. Gauges never carry
 // it: they are current values, not something that accumulates across a rebuild.
-func (e *Exposer) stamp(m *dto.Metric, en *entry) {
+func (e *Exposer) stamp(mf *dto.MetricFamily, m *dto.Metric, en *entry) {
 	if e.opts.GenLabel == "" {
+		return
+	}
+	if e.cached {
+		// The cached encoder puts the generation in the label string it keeps, so
+		// it is not carried on the dto, which would cost a label slice per series.
+		// Whether that encoder actually takes the family is only known once the
+		// family is complete, so a fallback stamps there instead; see stampFallback.
 		return
 	}
 	gen := e.rb.genOf(en)
