@@ -241,6 +241,16 @@ func MakeLabelPairs(desc *Desc, labelValues []string) []*dto.LabelPair {
 		// Moderately fast path.
 		return desc.constLabelPairs
 	}
+	// Every metric measuring one instance carries the same labels, and each is a
+	// separate child that would otherwise build and keep its own copy. Constant
+	// labels are left out of this: with them the pairs depend on the Desc too.
+	// See labelpaircache.go.
+	shareable := len(desc.constLabelPairs) == 0
+	if shareable {
+		if pairs := cachedLabelPairs(desc.variableLabels.names, labelValues); pairs != nil {
+			return pairs
+		}
+	}
 	labelPairs := make([]*dto.LabelPair, 0, totalLen)
 	for i, l := range desc.variableLabels.names {
 		labelPairs = append(labelPairs, &dto.LabelPair{
@@ -250,6 +260,9 @@ func MakeLabelPairs(desc *Desc, labelValues []string) []*dto.LabelPair {
 	}
 	labelPairs = append(labelPairs, desc.constLabelPairs...)
 	sort.Sort(internal.LabelPairSorter(labelPairs))
+	if shareable {
+		putLabelPairs(desc.variableLabels.names, labelValues, labelPairs)
+	}
 	return labelPairs
 }
 
