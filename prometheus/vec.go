@@ -321,7 +321,42 @@ type metricMap struct {
 	metrics   map[uint64][]metricWithLabelValues
 	desc      *Desc
 	newMetric func(labelValues ...string) Metric
+	// Largest len(metrics) since the map was last built, so that the buckets
+	// can be given back once most of them are empty. See shrink.
+	peak int
 }
+
+// shrink rebuilds metrics once it holds less than half of what it was sized
+// for. A Go map never returns its buckets: delete empties a slot and leaves the
+// array at its high-water mark, so a Vec whose children are deleted -- idle
+// cleanup on a per-key metric, say -- keeps the array it needed at its widest
+// for the life of the process. At 30k keys that is about a million slots held
+// to carry the 88k that are left, some 60MB per Vec family.
+//
+// The caller holds the write lock, which is also what a lookup takes, so this
+// has to stay rare rather than cheap: halving is the trigger, and a rebuild
+// resets the mark, so a cascade of deletions rebuilds a few times with each
+// pass smaller than the last. Measured at a million slots falling to 88k, the
+// copy is under 4ms.
+func (m *metricMap) shrink() {
+	n := len(m.metrics)
+	if n > m.peak {
+		m.peak = n
+		return
+	}
+	if m.peak < minShrinkMetrics || n >= m.peak/2 {
+		return
+	}
+	fresh := make(map[uint64][]metricWithLabelValues, n)
+	for h, ms := range m.metrics {
+		fresh[h] = ms
+	}
+	m.metrics = fresh
+	m.peak = n
+}
+
+// Below this the buckets are not worth the copy.
+const minShrinkMetrics = 1 << 12
 
 // Describe implements Collector. It will send exactly one Desc to the provided
 // channel.
@@ -351,6 +386,7 @@ func (m *metricMap) Reset() {
 			untrackMetric(mwlv.metric)
 		}
 		delete(m.metrics, h)
+		m.shrink()
 	}
 }
 
@@ -380,6 +416,7 @@ func (m *metricMap) deleteByHashWithLabelValues(
 		old[len(old)-1] = metricWithLabelValues{}
 	} else {
 		delete(m.metrics, h)
+		m.shrink()
 	}
 	return true
 }
@@ -406,6 +443,7 @@ func (m *metricMap) deleteMetric(h uint64, metric Metric) bool {
 			old[len(old)-1] = metricWithLabelValues{}
 		} else {
 			delete(m.metrics, h)
+			m.shrink()
 		}
 		return true
 	}
@@ -437,6 +475,7 @@ func (m *metricMap) deleteByHashWithLabels(
 		old[len(old)-1] = metricWithLabelValues{}
 	} else {
 		delete(m.metrics, h)
+		m.shrink()
 	}
 	return true
 }
@@ -458,6 +497,7 @@ func (m *metricMap) deleteByLabels(labels Labels, curry []curriedLabelValue) int
 			untrackMetric(mwlv.metric)
 		}
 		delete(m.metrics, h)
+		m.shrink()
 		numDeleted++
 	}
 
@@ -546,6 +586,9 @@ func (m *metricMap) getOrCreateMetricWithLabelValues(
 		inlinedLVs = shareLabelValues(m.desc, inlinedLVs)
 		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: inlinedLVs, metric: metric})
 		trackMetric(m, metric, hash)
+		if n := len(m.metrics); n > m.peak {
+			m.peak = n
+		}
 	}
 	return metric
 }
@@ -573,6 +616,9 @@ func (m *metricMap) getOrCreateMetricWithLabels(
 		lvs = shareLabelValues(m.desc, lvs)
 		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: lvs, metric: metric})
 		trackMetric(m, metric, hash)
+		if n := len(m.metrics); n > m.peak {
+			m.peak = n
+		}
 	}
 	return metric
 }
