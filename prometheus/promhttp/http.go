@@ -283,8 +283,10 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 		if !opts.ProcessStartTime.IsZero() {
 			rsp.Header().Set(processStartTimeHeader, strconv.FormatInt(opts.ProcessStartTime.Unix(), 10))
 		}
-		// Delta exposition, when it has been switched on with delta.Enable and
-		// the scraper asked for it with ?delta=1. Off by default, in which case
+		// Delta exposition, once it has been switched on with delta.Enable: from
+		// then on this is what every scrape gets, so no scrape config has to
+		// change. ?delta=0 asks for the cumulative exposition instead, which is
+		// there for debugging and consumes nothing. Off by default, in which case
 		// this is one atomic load. See the delta package.
 		if delta.ServeIfRequested(rsp, req) {
 			return

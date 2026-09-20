@@ -18,14 +18,20 @@
 // would be without it, and no scrape config has to change either: once enabled,
 // the handler promhttp already hands out answers with increments.
 //
-// Run it and watch three scrapes of the same handler:
+// Increments are what /metrics answers with from then on -- the address the
+// scraper already reads, so there is no parameter to add and no scrape config to
+// change. The one parameter there is, ?delta=0, is a debugging switch: it asks
+// for the ordinary cumulative exposition and consumes nothing, so it can be
+// curled next to a running scraper without taking increments away from it.
+//
+// Run it and watch five scrapes of the same handler:
 //
 //	go run ./examples/delta
 //
 // then leave it running and scrape it yourself:
 //
-//	curl -s localhost:8080/metrics          # increments, and consumes them
-//	curl -s 'localhost:8080/metrics?delta=0' # cumulative, consumes nothing
+//	curl -s localhost:8080/metrics           # increments -- what a scraper gets
+//	curl -s 'localhost:8080/metrics?delta=0' # cumulative -- for debugging only
 package main
 
 import (
@@ -94,6 +100,8 @@ func main() {
 		}
 	}
 
+	// Plain /metrics -- no parameter. This is what the scraper reads, and from
+	// here on it reads increments.
 	serve("/a", 3)
 	serve("/b", 1)
 	show(handler, "/metrics", "scrape 1: everything written so far")
@@ -103,12 +111,22 @@ func main() {
 
 	show(handler, "/metrics", "scrape 3: nothing moved, so only the gauges are here")
 
-	show(handler, "/metrics?delta=0", "?delta=0: the ordinary cumulative exposition, which consumes nothing")
+	// The one parameter there is. ?delta=0 is a DEBUGGING switch, not something a
+	// scraper sets: it asks for the ordinary cumulative exposition. It consumes
+	// nothing, so it is safe to curl next to a running scraper -- the scrape that
+	// follows still gets every increment, which is what the last round shows.
+	//
+	// (?delta=1 is not needed and is not used here: increments are the default
+	// once Enable has been called. It is still accepted, for configs written
+	// against the older behaviour.)
+	show(handler, "/metrics?delta=0", "?delta=0: cumulative values, for debugging -- consumes nothing")
 
 	serve("/b", 4)
-	show(handler, "/metrics", "scrape 4: the cumulative read above did not eat /b's 4")
+	show(handler, "/metrics", "scrape 4: the debugging read above did not eat /b's 4")
 
-	fmt.Println("serving on :8080, try: curl -s localhost:8080/metrics")
+	fmt.Println("\nserving on :8080")
+	fmt.Println("  curl -s localhost:8080/metrics            increments -- what a scraper gets, no parameter needed")
+	fmt.Println("  curl -s 'localhost:8080/metrics?delta=0'  cumulative -- debugging only, consumes nothing")
 	http.Handle("/metrics", handler)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
