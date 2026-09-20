@@ -174,7 +174,6 @@ type entry struct {
 	sum       float64           // histogram: last delivered _sum
 	count     uint64            // histogram: last delivered _count
 	metric    prometheus.Metric // the instance, on the change-tracking path
-	out       *dto.Metric       // reused output dto, on the change-tracking path
 	buckets   []uint64          // histogram: last delivered cumulative count per le
 	spare     []uint64          // buffer rotated with buckets
 	changed   uint64            // last scrape whose value differed from the delivered one

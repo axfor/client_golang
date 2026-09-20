@@ -58,8 +58,17 @@ type TrackedExposer struct {
 	rows    [][]*entry // rows[i] are the entries behind buf[i].Metric, in order
 	taken   []prometheus.Metric
 	gauges  []prometheus.Metric // every gauge seen, walked in full every scrape
-	byName  map[string]int      // family name to its index in buf
-	enc     *encState
+
+	// A dto is only needed for the instances written in one scrape, which at a
+	// realistic active share is a small part of what is registered. They are
+	// lent out per scrape instead of kept per instance, from a free list per
+	// family so that the one handed out already has the family's bucket layout
+	// and Write updates it in place.
+	free   map[string][]*dto.Metric
+	lent   []loan
+	peak   map[string]int // recent high-water mark of borrows, so the free list can fall back
+	byName map[string]int // family name to its index in buf
+	enc    *encState
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -74,6 +83,8 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 		opts:    opts,
 		tracker: t,
 		state:   map[prometheus.Metric]*entry{},
+		free:    map[string][]*dto.Metric{},
+		peak:    map[string]int{},
 		byName:  map[string]int{},
 		enc:     newEncState(),
 	}
@@ -185,6 +196,8 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 			prometheus.MarkChanged(m)
 		}
 	}
+	e.returnAll()
+
 	clear(taken)
 	e.taken = taken[:0]
 	st.Deleted = e.drop(idle)
@@ -203,18 +216,19 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 	}
 	en.lastRound = e.round
 
-	// Write into the instance's own dto rather than a shared scratch: a dto that
+	// Write into a dto borrowed for this scrape rather than a shared scratch: one
 	// a previous Write already filled in is updated in place, so a steady-state
-	// scrape allocates nothing here. The first time there is nothing to update,
-	// so it goes through the scratch and keeps a copy.
-	out := en.out
+	// scrape allocates nothing here. An empty free list means there is nothing to
+	// update, so it goes through the scratch and keeps the copy.
+	name := desc.Name()
+	out := e.borrow(name)
 	if out == nil {
 		e.scratch.Reset()
 		if err := m.Write(&e.scratch); err != nil {
 			return nil, false
 		}
 		out = cloneMetric(&e.scratch)
-		en.out = out
+		e.lent = append(e.lent, loan{name, out})
 	} else if err := m.Write(out); err != nil {
 		return nil, false
 	}
@@ -271,6 +285,54 @@ func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric, en *entry)
 	mf.Metric = append(mf.Metric, m)
 	e.rows[idx] = append(e.rows[idx], en)
 	return mf, idx
+}
+
+// loan is a dto handed out for one scrape, and the family to put it back under.
+type loan struct {
+	family string
+	m      *dto.Metric
+}
+
+// borrow takes a dto off the family's free list, or returns nil when it is
+// empty. What it hands out is recorded so that returnAll can take it back once
+// the response has been written.
+func (e *TrackedExposer) borrow(family string) *dto.Metric {
+	l := e.free[family]
+	if len(l) == 0 {
+		return nil
+	}
+	out := l[len(l)-1]
+	e.free[family] = l[:len(l)-1]
+	e.lent = append(e.lent, loan{family, out})
+	return out
+}
+
+// returnAll puts this scrape's dtos back, and lets the free lists fall back
+// towards what recent scrapes actually used. Without that they would stay at
+// their high-water mark, which is the first scrape after start-up: every
+// instance is new then, so every one is written, and the lists would keep a dto
+// per instance for the rest of the process -- the very thing lending them
+// avoids. The mark decays by an eighth a scrape, so a burst is given up over a
+// few minutes while a steady load never has to reallocate.
+func (e *TrackedExposer) returnAll() {
+	used := map[string]int{}
+	for i, l := range e.lent {
+		e.free[l.family] = append(e.free[l.family], l.m)
+		used[l.family]++
+		e.lent[i].m = nil
+	}
+	e.lent = e.lent[:0]
+	for family, l := range e.free {
+		mark := e.peak[family] - e.peak[family]/8
+		if used[family] > mark {
+			mark = used[family]
+		}
+		e.peak[family] = mark
+		if keep := mark + mark/4; len(l) > keep {
+			clear(l[keep:])
+			e.free[family] = l[:keep]
+		}
+	}
 }
 
 // decide reuses Exposer's change-only and delta logic.

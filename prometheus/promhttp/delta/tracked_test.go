@@ -390,3 +390,54 @@ func TestOutageLongerThanIdleScrapes(t *testing.T) {
 		t.Errorf("the 5 written before the outage was lost: got %v, want c_total{key=a}=5", got)
 	}
 }
+
+// A dto is needed only for the instances written in one scrape. Keeping one per
+// instance was 19% of the heap of a sidecar holding 30k keys of which a small
+// share is active, so they are lent out per scrape and taken back.
+func TestDTOsAreLentPerScrapeNotPerInstance(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true})
+	const keys = 200
+	for i := range keys {
+		f.c.WithLabelValues(strconv.Itoa(i)).Inc()
+	}
+	f.scrape(t, false) // every counter is new, so every one is written
+
+	pooled := func() int {
+		n := 0
+		for _, l := range f.exp.free {
+			n += len(l)
+		}
+		return n
+	}
+	if got := pooled(); got < keys {
+		t.Fatalf("after a scrape that wrote %d instances the pool holds %d; they should have come back", keys, got)
+	}
+	if len(f.exp.lent) != 0 {
+		t.Errorf("%d dtos are still on loan after the scrape", len(f.exp.lent))
+	}
+
+	// From here on only two counters move. The pool has to fall back towards
+	// that: the first scrape after start-up writes every instance, and a pool
+	// left at that mark would hold a dto per instance for the rest of the
+	// process, which is what lending them is meant to avoid.
+	before := pooled()
+	for range 40 {
+		f.c.WithLabelValues("0").Inc()
+		f.c.WithLabelValues("1").Inc()
+		f.scrape(t, false)
+	}
+	after := pooled()
+	if after >= before {
+		t.Errorf("the pool stayed at %d after %d quiet scrapes; it should fall back from %d", after, 40, before)
+	}
+	if after > keys/10 {
+		t.Errorf("after 40 scrapes writing two instances the pool still holds %d of the %d it peaked at", after, before)
+	}
+
+	// And the values still come out right through a recycled dto.
+	f.c.WithLabelValues("7").Add(3)
+	m, _ := f.scrape(t, false)
+	if m[`c_total{key=7}`] != 3 {
+		t.Errorf("a recycled dto reported the wrong increment: %v", m[`c_total{key=7}`])
+	}
+}
