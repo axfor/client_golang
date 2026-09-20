@@ -97,32 +97,10 @@ func main() {
 	// scrape.
 	trk := prometheus.EnableChangeTracking()
 
-	frameworkReg := prometheus.NewRegistry()
-	usageReg := prometheus.NewRegistry()
-
-	// Framework metrics: labels that do not grow with traffic.
-	routerRequests := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "router_requests_total",
-		Help: "Requests handled, by route.",
-	}, []string{"route"})
-	frameworkReg.MustRegister(routerRequests)
-
-	// Per-key metrics. Note requests_concurrent_total: a gauge whose name ends
-	// in _total, which is exactly the case a naming convention gets wrong.
-	usageRequests := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "usage_requests_total",
-		Help: "Requests served, by API key.",
-	}, []string{"apikey_id"})
-	usageLatency := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "usage_duration_seconds",
-		Help:    "Time to serve a request, by API key.",
-		Buckets: []float64{0.1, 1},
-	}, []string{"apikey_id"})
-	usageInFlight := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "usage_requests_concurrent_total",
-		Help: "Requests in flight, by API key.",
-	}, []string{"apikey_id"})
-	usageReg.MustRegister(usageRequests, usageLatency, usageInFlight)
+	// Everything from here to the exposers is the application's own: these are
+	// the metrics it would define and write either way, and nothing about them
+	// changes to report increments.
+	frameworkReg, usageReg, m := defineMetrics()
 
 	// Increments() is the combination this package recommends for feeding an
 	// aggregator: report what accrued since the last delivered scrape, say
@@ -145,11 +123,11 @@ func main() {
 
 	serve := func(route, key string, n int) {
 		for range n {
-			routerRequests.WithLabelValues(route).Inc()
-			usageInFlight.WithLabelValues(key).Inc()
-			usageRequests.WithLabelValues(key).Inc()
-			usageLatency.WithLabelValues(key).Observe(0.05)
-			usageInFlight.WithLabelValues(key).Dec()
+			m.routerRequests.WithLabelValues(route).Inc()
+			m.inFlight.WithLabelValues(key).Inc()
+			m.requests.WithLabelValues(key).Inc()
+			m.latency.WithLabelValues(key).Observe(0.05)
+			m.inFlight.WithLabelValues(key).Dec()
 		}
 	}
 
@@ -211,4 +189,43 @@ func show(h http.Handler, target, what string) {
 		return
 	}
 	fmt.Println(strings.Join(lines, "\n"))
+}
+
+// metrics is what the application measures. None of it is delta-aware: these
+// are ordinary Vecs, written with ordinary Inc and Observe calls, and they read
+// the same whether or not increments are being reported.
+type metrics struct {
+	routerRequests *prometheus.CounterVec
+	requests       *prometheus.CounterVec
+	latency        *prometheus.HistogramVec
+	inFlight       *prometheus.GaugeVec
+}
+
+func defineMetrics() (framework, usage *prometheus.Registry, m metrics) {
+	framework, usage = prometheus.NewRegistry(), prometheus.NewRegistry()
+
+	// Framework metrics: labels that do not grow with traffic.
+	m.routerRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "router_requests_total",
+		Help: "Requests handled, by route.",
+	}, []string{"route"})
+	framework.MustRegister(m.routerRequests)
+
+	// Per-key metrics. Note requests_concurrent_total: a gauge whose name ends
+	// in _total, which is exactly the case a naming convention gets wrong.
+	m.requests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "usage_requests_total",
+		Help: "Requests served, by API key.",
+	}, []string{"apikey_id"})
+	m.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "usage_duration_seconds",
+		Help:    "Time to serve a request, by API key.",
+		Buckets: []float64{0.1, 1},
+	}, []string{"apikey_id"})
+	m.inFlight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "usage_requests_concurrent_total",
+		Help: "Requests in flight, by API key.",
+	}, []string{"apikey_id"})
+	usage.MustRegister(m.requests, m.latency, m.inFlight)
+	return framework, usage, m
 }
