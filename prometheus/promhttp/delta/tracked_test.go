@@ -711,3 +711,50 @@ func TestTrackedCountFollowsIdleDeletion(t *testing.T) {
 		t.Fatalf("after two of three aged out: %d, want 1", n)
 	}
 }
+
+// The scrape scratch has to let go of what it pointed at. Truncating a slice
+// leaves its backing array intact, and the first scrape after start-up sizes
+// these to every instance in the process: idle cleanup then drops an entry from
+// state and from its Vec while a stale pointer in the scratch keeps it, its
+// labels, its dto and the instance itself on the heap for good. Nothing fails
+// when that happens -- the numbers stay right, the process just never gives the
+// memory back -- so it is asserted rather than measured.
+func TestScrapeScratchHoldsNothingAfterTheScrape(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
+
+	// A wide first scrape, the way a process looks after warm-up: every
+	// instance is new, so every one is written and the scratch grows to fit.
+	for i := range 200 {
+		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+	}
+	f.scrape(t, false)
+
+	// Then let all but one age out, so the scratch is far larger than the live
+	// set and any pointer left past the length is to something already dropped.
+	for range 5 {
+		f.c.WithLabelValues("k0").Inc()
+		f.scrape(t, false)
+	}
+	if n := f.exp.Tracked(); n != 1 {
+		t.Fatalf("%d instances still tracked, want 1", n)
+	}
+
+	f.exp.mu.Lock()
+	defer f.exp.mu.Unlock()
+	for i, r := range f.exp.rows {
+		full := r[:cap(r)]
+		for j := len(r); j < len(full); j++ {
+			if full[j] != nil {
+				t.Fatalf("rows[%d] still points at an entry at index %d, past its length %d (cap %d)",
+					i, j, len(r), cap(r))
+			}
+		}
+	}
+	full := f.exp.taken[:cap(f.exp.taken)]
+	for j := len(f.exp.taken); j < len(full); j++ {
+		if full[j] != nil {
+			t.Fatalf("taken still holds a metric at index %d, past its length %d (cap %d)",
+				j, len(f.exp.taken), cap(f.exp.taken))
+		}
+	}
+}

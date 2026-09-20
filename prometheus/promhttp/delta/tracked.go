@@ -116,8 +116,15 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	st.Round = e.round
 	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
 
+	// Clear to the capacity, not just the length. Truncating alone leaves the
+	// pointers in the backing array, and the first scrape after start-up sizes
+	// that array to every instance the process has: idle cleanup then drops an
+	// entry from state and from its Vec while these keep it -- and its labels,
+	// its dto and the instance itself -- alive for the life of the process.
 	for i := range e.rows {
-		e.rows[i] = e.rows[i][:0]
+		r := e.rows[i]
+		clear(r[:cap(r)])
+		e.rows[i] = r[:0]
 	}
 	e.buf = e.buf[:0]
 	clear(e.byName)
@@ -210,6 +217,9 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	e.returnAll()
 
 	clear(taken)
+	// Same as e.rows above: these are live instances, and holding them past the
+	// scrape keeps everything they reference.
+	clear(taken[:cap(taken)])
 	e.taken = taken[:0]
 	st.Deleted = e.drop(idle)
 	return st
