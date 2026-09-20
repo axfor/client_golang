@@ -90,6 +90,17 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 	}
 }
 
+// Tracked returns how many instances this exposer is holding state for. It is
+// the number idle cleanup shrinks, so a caller watching memory can tell an
+// instance that was dropped from one that is merely quiet -- reading it off a
+// Gather instead walks every instance in the registry, which is the cost the
+// dirty list exists to avoid.
+func (e *TrackedExposer) Tracked() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.state)
+}
+
 // Handler returns an http.Handler.
 func (e *TrackedExposer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { e.Serve(w, r) })

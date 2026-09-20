@@ -684,3 +684,30 @@ func TestTypeLabelAlongsideGeneration(t *testing.T) {
 		t.Errorf("labels out of sorted order: %q", line)
 	}
 }
+
+// Tracked has to follow what the exposer is actually holding. A count taken once
+// and cached reads the same forever, which looks right on every dashboard and
+// hides exactly the thing it is there to show: whether idle cleanup is running.
+func TestTrackedCountFollowsIdleDeletion(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
+	if n := f.exp.Tracked(); n != 0 {
+		t.Fatalf("a fresh exposer holds %d instances, want 0", n)
+	}
+
+	for _, k := range []string{"a", "b", "c"} {
+		f.c.WithLabelValues(k).Add(1)
+	}
+	f.scrape(t, false)
+	if n := f.exp.Tracked(); n != 3 {
+		t.Fatalf("after three instances were reported: %d, want 3", n)
+	}
+
+	// Keep writing to one of them, so the other two age out and it does not.
+	for i := 0; i < 5; i++ {
+		f.c.WithLabelValues("a").Add(1)
+		f.scrape(t, false)
+	}
+	if n := f.exp.Tracked(); n != 1 {
+		t.Fatalf("after two of three aged out: %d, want 1", n)
+	}
+}
