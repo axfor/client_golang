@@ -68,6 +68,24 @@ func cachedLabelPairs(names, values []string) []*dto.LabelPair {
 	return s.pairs
 }
 
+// sharedLabelValues returns the copy of these values the cache already holds, or
+// nil when it holds something else. A Vec keeps the values of every child it
+// has, to match against on Delete and on a partial lookup, and those are the
+// same values for every metric measuring one instance -- so they are the same
+// slice, read but never written. Callers keep their own when this returns nil.
+func sharedLabelValues(names, values []string) []string {
+	s := labelPairCache[labelPairHash(names, values)].Load()
+	if s == nil || len(s.names) != len(names) || len(s.values) != len(values) {
+		return nil
+	}
+	for i := range names {
+		if s.names[i] != names[i] || s.values[i] != values[i] {
+			return nil
+		}
+	}
+	return s.values
+}
+
 // putLabelPairs offers pairs to the cache. names and values are copied: they
 // belong to the caller, which is free to reuse them.
 func putLabelPairs(names, values []string, pairs []*dto.LabelPair) {

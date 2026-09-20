@@ -540,6 +540,10 @@ func (m *metricMap) getOrCreateMetricWithLabelValues(
 	if !ok {
 		inlinedLVs := inlineLabelValues(lvs, curry)
 		metric = m.newMetric(inlinedLVs...)
+		// newMetric built this instance's label pairs, so the cache now holds a
+		// copy of these values; keeping that one rather than a second copy per
+		// child is the same saving as sharing the pairs themselves.
+		inlinedLVs = shareLabelValues(m.desc, inlinedLVs)
 		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: inlinedLVs, metric: metric})
 		trackMetric(m, metric, hash)
 	}
@@ -566,6 +570,7 @@ func (m *metricMap) getOrCreateMetricWithLabels(
 	if !ok {
 		lvs := extractLabelValues(m.desc, labels, curry)
 		metric = m.newMetric(lvs...)
+		lvs = shareLabelValues(m.desc, lvs)
 		m.metrics[hash] = append(m.metrics[hash], metricWithLabelValues{values: lvs, metric: metric})
 		trackMetric(m, metric, hash)
 	}
@@ -665,6 +670,19 @@ func matchLabels(desc *Desc, values []string, labels Labels, curry []curriedLabe
 		}
 	}
 	return true
+}
+
+// shareLabelValues swaps lvs for the copy the label pair cache already holds,
+// when it holds one for these values. Constant labels keep a Desc out of that
+// cache, and then there is nothing to share against.
+func shareLabelValues(desc *Desc, lvs []string) []string {
+	if len(desc.constLabelPairs) != 0 {
+		return lvs
+	}
+	if shared := sharedLabelValues(desc.variableLabels.names, lvs); shared != nil {
+		return shared
+	}
+	return lvs
 }
 
 func extractLabelValues(desc *Desc, labels Labels, curry []curriedLabelValue) []string {
