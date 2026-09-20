@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -439,5 +440,66 @@ func TestDTOsAreLentPerScrapeNotPerInstance(t *testing.T) {
 	m, _ := f.scrape(t, false)
 	if m[`c_total{key=7}`] != 3 {
 		t.Errorf("a recycled dto reported the wrong increment: %v", m[`c_total{key=7}`])
+	}
+}
+
+// Stamping the generation on the dto and keeping rebase bases are things only
+// some configurations do, so those fields live in a struct allocated when one of
+// them first needs it. A configuration that needs neither must not end up with
+// one per instance: that is 96 bytes on every series, which is what moving them
+// out of the entry was for.
+func TestNoSideStructWhenNothingNeedsOne(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, GenLabel: "gen"})
+	for i := range 50 {
+		f.c.WithLabelValues(strconv.Itoa(i)).Inc()
+		f.h.WithLabelValues(strconv.Itoa(i)).Observe(1)
+	}
+	for range 3 {
+		f.scrape(t, false)
+	}
+
+	var with, total int
+	for _, en := range f.exp.state {
+		total++
+		if en.extra != nil {
+			with++
+		}
+	}
+	if total == 0 {
+		t.Fatal("no entries to check")
+	}
+	if with != 0 {
+		t.Errorf("%d of %d entries carry a side struct; reporting increments needs none of what it holds", with, total)
+	}
+}
+
+// And the configuration that does need one gets it, once it does: a generation
+// only exists after a gap has moved it, so configuring RebaseAfterGap is not
+// itself enough.
+func TestSideStructAppearsOnceTheGenerationMoves(t *testing.T) {
+	f := newTrackedFixture(t, Options{
+		DisableHeartbeat: true, IdleScrapes: 30, GenLabel: "gen",
+		RebaseAfterGap: 30 * time.Minute, HeartbeatScrapes: 1,
+	})
+	now := time.Unix(1000, 0)
+	f.exp.rb.now = func() time.Time { return now }
+
+	f.c.WithLabelValues("a").Add(60)
+	f.scrape(t, false)
+	for _, en := range f.exp.state {
+		if en.extra != nil {
+			t.Fatal("no gap has happened yet, so there is no generation to keep a base for")
+		}
+	}
+
+	now = time.Unix(1000+46*60, 0) // longer than RebaseAfterGap
+	f.c.WithLabelValues("a").Add(30)
+	if _, st := f.scrape(t, false); !st.Rebased {
+		t.Fatalf("46 minutes since the last delivery: the generation should have moved (%+v)", st)
+	}
+	for _, en := range f.exp.state {
+		if en.extra == nil {
+			t.Error("the generation moved and the entry has nowhere to keep its base")
+		}
 	}
 }

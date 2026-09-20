@@ -179,21 +179,39 @@ type entry struct {
 	changed   uint64            // last scrape whose value differed from the delivered one
 	lastRound uint64            // last scrape this was seen in
 
-	born       int64            // creation time in Unix seconds, the value of GenLabel
-	genPair    *dto.LabelPair   // the generation label, updated in place
-	genLabels  []*dto.LabelPair // the labels with the generation appended, built once
-	genStamped int64            // the generation genPair currently carries
+	born int64 // creation time in Unix seconds, the value of GenLabel
 
 	// The rendered labels of this series, without the closing brace, plus the
 	// generation they were rendered under. Shared with every other entry of the
 	// same instance, see encState.share.
 	rendered    string
 	renderedGen int64
+	// What only some configurations need, allocated when one of them first
+	// does. Stamping the generation on the dto is the Gather path only -- the
+	// cached encoder writes it into the label string it keeps -- and the bases
+	// only exist under RebaseAfterGap, which ReportIncrements rules out. Holding
+	// them inline cost 96 of the entry's 264 bytes on every instance of every
+	// configuration, whether or not it had any use for them.
+	extra *entryExtra
+}
+
+type entryExtra struct {
+	genPair    *dto.LabelPair   // the generation label, updated in place
+	genLabels  []*dto.LabelPair // the labels with the generation appended, built once
+	genStamped int64            // the generation genPair currently carries
+
 	basedOn     int64 // the generation the bases below belong to
 	baseValue   float64
 	baseSum     float64
 	baseCount   uint64
 	baseBuckets []uint64
+}
+
+func (en *entry) ext() *entryExtra {
+	if en.extra == nil {
+		en.extra = &entryExtra{}
+	}
+	return en.extra
 }
 
 // New returns an Exposer reading from g.
@@ -332,7 +350,7 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		if e.opts.ReportIncrements {
 			*m.Counter.Value = cur - en.value // in place: Gather returns a fresh copy
 		} else if e.rb.gen != 0 {
-			*m.Counter.Value = cur - en.baseValue
+			*m.Counter.Value = cur - en.ext().baseValue
 		}
 		e.stamp(mf, m, en)
 		return true, !changed, &pendingCommit{en: en, value: cur}
@@ -371,8 +389,8 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 				*b.CumulativeCount = b.GetCumulativeCount() - prev
 			}
 		} else if e.rb.gen != 0 {
-			*h.SampleSum = sum - en.baseSum
-			*h.SampleCount = count - en.baseCount
+			*h.SampleSum = sum - en.ext().baseSum
+			*h.SampleCount = count - en.ext().baseCount
 			for i, b := range h.Bucket {
 				*b.CumulativeCount = b.GetCumulativeCount() - en.baseBucket(i)
 			}
@@ -409,22 +427,23 @@ func (e *Exposer) stamp(mf *dto.MetricFamily, m *dto.Metric, en *entry) {
 		return
 	}
 	gen := e.rb.genOf(en)
-	if en.genPair == nil {
+	x := en.ext()
+	if x.genPair == nil {
 		// Built once. The label slice handed out by Write belongs to the metric
 		// itself, so it is copied rather than appended to.
 		name, value := e.opts.GenLabel, strconv.FormatInt(gen, 10)
-		en.genPair = &dto.LabelPair{Name: &name, Value: &value}
+		x.genPair = &dto.LabelPair{Name: &name, Value: &value}
 		at, replace := genIndex(m.Label, name)
-		en.genLabels = withLabel(m.Label, en.genPair, at, replace)
-		en.genStamped = gen
-	} else if en.genStamped != gen {
+		x.genLabels = withLabel(m.Label, x.genPair, at, replace)
+		x.genStamped = gen
+	} else if x.genStamped != gen {
 		value := strconv.FormatInt(gen, 10)
-		en.genPair.Value = &value
-		en.genStamped = gen
+		x.genPair.Value = &value
+		x.genStamped = gen
 	}
 	// Write resets the labels to the metric's own every scrape, so put the
 	// stamped set back.
-	m.Label = en.genLabels
+	m.Label = x.genLabels
 }
 
 // deletable reports whether an idle series may be dropped.

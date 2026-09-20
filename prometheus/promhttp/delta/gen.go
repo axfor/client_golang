@@ -90,19 +90,29 @@ func (rb *rebaseState) genOf(en *entry) int64 {
 // written after a rebase: what it had already delivered becomes its base, so the
 // new series starts from the increment that never arrived.
 func (rb *rebaseState) rebaseEntry(en *entry) {
-	if en.basedOn == rb.gen {
+	// Read the generation this entry is based on without allocating the side
+	// struct to hold it: with no generation in play, which is every scrape of a
+	// configuration that reports increments, both are zero and there is nothing
+	// to do. Allocating first would put one on every instance -- the very cost
+	// moving these fields out was meant to avoid.
+	var basedOn int64
+	if x := en.extra; x != nil {
+		basedOn = x.basedOn
+	}
+	if basedOn == rb.gen {
 		return
 	}
-	en.basedOn = rb.gen
-	en.baseValue = en.value
-	en.baseSum = en.sum
-	en.baseCount = en.count
-	en.baseBuckets = append(en.baseBuckets[:0], en.buckets...)
+	x := en.ext()
+	x.basedOn = rb.gen
+	x.baseValue = en.value
+	x.baseSum = en.sum
+	x.baseCount = en.count
+	x.baseBuckets = append(x.baseBuckets[:0], en.buckets...)
 }
 
 func (en *entry) baseBucket(i int) uint64 {
-	if i < len(en.baseBuckets) {
-		return en.baseBuckets[i]
+	if x := en.extra; x != nil && i < len(x.baseBuckets) {
+		return x.baseBuckets[i]
 	}
 	return 0
 }
