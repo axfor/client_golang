@@ -17,6 +17,7 @@ import (
 	"context"
 	"math/rand"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -756,5 +757,76 @@ func TestScrapeScratchHoldsNothingAfterTheScrape(t *testing.T) {
 			t.Fatalf("taken still holds a metric at index %d, past its length %d (cap %d)",
 				j, len(f.exp.taken), cap(f.exp.taken))
 		}
+	}
+}
+
+// mapPtr identifies the map object itself, so a test can tell a rebuilt map
+// from one that was only emptied.
+func mapPtr(e *TrackedExposer) uintptr {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return reflect.ValueOf(e.state).Pointer()
+}
+
+// A Go map never returns its buckets: delete leaves the array at the size the
+// map once needed, which for a sidecar is every instance it held before idle
+// cleanup ran. The count read right, the heap did not -- so this asserts the
+// map object was replaced, which is the only way the buckets go back.
+func TestStateMapIsRebuiltAfterMassDeletion(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
+
+	const n = minShrinkState + 1000
+	for i := range n {
+		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+	}
+	f.scrape(t, false)
+	if got := f.exp.Tracked(); got != n {
+		t.Fatalf("tracked %d instances, want %d", got, n)
+	}
+	before := mapPtr(f.exp)
+
+	// Keep one alive so the map is not simply empty.
+	for range 5 {
+		f.c.WithLabelValues("k0").Inc()
+		f.scrape(t, false)
+	}
+	if got := f.exp.Tracked(); got != 1 {
+		t.Fatalf("tracked %d instances after the rest aged out, want 1", got)
+	}
+	if mapPtr(f.exp) == before {
+		t.Error("the state map was emptied but not rebuilt, so it still holds buckets for every instance that is gone")
+	}
+
+	// The survivor has to come through the rebuild with its state intact.
+	f.c.WithLabelValues("k0").Add(2)
+	if m, _ := f.scrape(t, false); m[`c_total{key=k0}`] != 2 {
+		t.Fatalf("the surviving instance should report the increment since the last scrape: %v", m)
+	}
+}
+
+// And a population that is merely quiet must not be rebuilt on every scrape:
+// the copy is only worth it when most of the map is gone.
+func TestStateMapIsNotRebuiltWhileThePopulationHolds(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
+
+	const n = minShrinkState + 1000
+	for i := range n {
+		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+	}
+	f.scrape(t, false)
+	before := mapPtr(f.exp)
+
+	// Every instance stays active, so nothing ages out and nothing is copied.
+	for range 6 {
+		for i := range n {
+			f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+		}
+		f.scrape(t, false)
+	}
+	if f.exp.Tracked() != n {
+		t.Fatalf("tracked %d, want %d -- nothing should have aged out", f.exp.Tracked(), n)
+	}
+	if mapPtr(f.exp) != before {
+		t.Error("the state map was rebuilt while its population held, which pays the copy for nothing")
 	}
 }

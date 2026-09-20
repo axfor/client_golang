@@ -69,6 +69,10 @@ type TrackedExposer struct {
 	peak   map[string]int // recent high-water mark of borrows, so the free list can fall back
 	byName map[string]int // family name to its index in buf
 	enc    *encState
+
+	// Recent high-water mark of len(state), so the map can be given back
+	// after idle cleanup instead of staying at the size it once needed.
+	statePeak int
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -390,8 +394,40 @@ func (e *TrackedExposer) drop(idle []*entry) int {
 		delete(e.state, en.metric)
 		en.metric = nil
 	}
+	e.shrinkState()
 	return len(idle)
 }
+
+// shrinkState rebuilds the state map once it is holding far fewer instances
+// than it was sized for. A Go map never gives its buckets back: delete leaves
+// the array at the high-water mark, which here is every instance the process
+// had before idle cleanup ran. At 30k keys that mark is about a million, and
+// the map alone stays at 45MB to hold the 88k that are left.
+//
+// The mark decays the way the dto free lists do, so a burst is given up over a
+// few scrapes rather than pinned for the life of the process, and a rebuild
+// only happens when what is left is less than half of it -- copying the live
+// entries costs an allocation and one insert each, which at a steady
+// population never happens twice.
+func (e *TrackedExposer) shrinkState() {
+	if n := len(e.state); n > e.statePeak {
+		e.statePeak = n
+		return
+	}
+	e.statePeak -= e.statePeak / 8
+	if len(e.state) >= e.statePeak/2 || e.statePeak < minShrinkState {
+		return
+	}
+	fresh := make(map[prometheus.Metric]*entry, len(e.state))
+	for m, en := range e.state {
+		fresh[m] = en
+	}
+	e.state = fresh
+	e.statePeak = len(e.state)
+}
+
+// Below this the buckets are not worth the copy.
+const minShrinkState = 1 << 12
 
 func metricType(m *dto.Metric) *dto.MetricType {
 	var t dto.MetricType
