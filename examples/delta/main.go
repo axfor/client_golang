@@ -11,68 +11,82 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Exposing increments instead of cumulative values, to two scrapers at once.
+// Exposing increments instead of cumulative values, to three scrapers at once.
 //
 // # What this is shaped like
 //
-// One process measures two quite different things:
+// One process measures things of three different shapes, and each wants
+// something different from a scraper:
 //
 //   - Framework metrics. A few dozen series, fixed: no per-request labels, so
-//     the count does not grow. Watched on a dashboard, so they are wanted every
-//     ten seconds.
-//   - Usage metrics. One set per API key, so hundreds of thousands of series.
-//     They feed billing, so they are wanted complete rather than fresh, and once
-//     a minute is enough.
+//     the count does not grow. Watched on a dashboard, wanted every ten seconds.
+//   - Per-key counters and histograms. One set per API key, so hundreds of
+//     thousands of series. They feed billing, so they are wanted complete rather
+//     than fresh, and once a minute is enough.
+//   - Per-key gauges. Requests in flight, a breaker's state, a config version:
+//     current values, not something that accumulates.
 //
-// Serving both from one /metrics makes the cheap job expensive: a scraper pulls
-// the whole body and only then drops what it does not keep, so the ten-second
-// job moves the per-key payload six times a minute to keep its few dozen series.
+// # Why three endpoints
 //
-// # Why two endpoints and not one
+// Two constraints, and between them they settle the shape.
 //
-// Increments have one rule: an endpoint has one consumer. What it reports is
+// One: an endpoint that reports increments has one consumer. What it reports is
 // what accrued since it last delivered successfully, and that baseline is one
 // baseline. A second scraper on the same endpoint takes increments the first one
 // then never sees -- and nothing fails, the numbers are just quietly short.
 //
-// So each scraper gets its own endpoint with its own exposer, and each exposer
-// keeps its own baselines. The rule then holds by construction rather than by
-// everyone remembering it.
+// Two: an aggregator adds up what a counter reports and reads a gauge as it
+// stands. Those are different operations, and the exposition format carries no
+// type for it to switch on, so it has to be told which metric is which -- by
+// name, in a list somebody has to keep up to date. The asymmetry is what makes
+// that bad: a counter added later matches a pattern like acg_.+ and is right, a
+// gauge added later matches the same pattern and is silently accumulated, and
+// nothing fails there either.
 //
-//	/metrics        framework metrics   every 10s   delta.New over its registry
-//	/metrics/usage  usage metrics       every 60s   delta.NewTracked over the tracker
+// So: one endpoint per consumer, and the two kinds split by Options.Only, which
+// puts the knowledge of which is which back in the only place that has it.
 //
-// # Why the two are built differently
+//	/metrics              framework, cumulative   10s   plain promhttp
+//	/metrics/usage        counters + histograms   60s   delta.NewTracked, Accumulating
+//	/metrics/usage-gauges gauges                  60s   delta.New, Current
+//
+// The aggregator then picks the arithmetic by which endpoint it scraped:
+//
+//   - match: '{job="usage"}'         outputs: [sum_samples_total]
+//   - match: '{job="usage-gauges"}'  outputs: [sum_samples]
+//
+// No metric name appears anywhere in that config, and a metric added later
+// lands on the right endpoint by its own type.
+//
+// # Why the three are built differently
 //
 // The tracked exposer finds what to report by draining a list of the instances
 // written since the last scrape, which is what makes it hold up at a million
-// series. That list is shared, so two tracked exposers would drain it from each
-// other.
+// series. That list is shared, so a second tracked exposer would drain it from
+// the first -- which is why the gauge endpoint gathers instead. It walks its
+// registry every scrape and compares, which at a few thousand gauges costs
+// nothing and touches no dirty list.
 //
-// The Gather exposer walks everything every scrape and compares. At a few dozen
-// series that costs nothing, and it never touches the dirty list -- so the two
-// coexist. The rule is: the big one is tracked, the small ones gather.
+// The framework endpoint is not a delta exposer at all. A few dozen fixed series
+// gain nothing from reporting increments, and making them increments would mean
+// aggregating them too -- a second thing to configure for no benefit. A plain
+// handler consumes no increments, so it sits beside the other two safely, and
+// the ten-second job's scrape config does not change at all.
 //
 // # Reading cumulative values
 //
-// An exposer's own Handler answers every request with a delta -- ?delta=0 is
-// read by delta.Enable, which is the other way to wire this up, and an exposer
-// mounted by hand never sees it. So mount a plain promhttp handler for anything
-// that wants cumulative values. It gathers the registry and touches none of the
-// exposer's baselines, so it is safe to curl next to a running scraper.
+// An exposer's own Handler answers every request with a delta. ?delta=0 is read
+// by delta.Enable, the other way to wire this up; an exposer mounted by hand
+// never sees it. Anything that wants cumulative values gets a plain promhttp
+// handler of its own, which touches no baseline and is safe to curl next to a
+// running scraper.
 //
 //	go run ./examples/delta
 //
-//	curl -s localhost:9090/metrics             framework, increments
-//	curl -s localhost:9090/metrics/usage       usage, increments
-//	curl -s localhost:9090/metrics/cumulative  usage, cumulative, for debugging
-//
-// # One thing to expect on the usage endpoint
-//
-// Change tracking is process-wide, so the framework metrics are tracked too and
-// the usage endpoint reports them as well. They are a few dozen series and the
-// scraper that reads this endpoint drops them, so it costs nothing -- but it is
-// what the output below shows.
+//	curl -s localhost:9090/metrics               framework, cumulative
+//	curl -s localhost:9090/metrics/usage         counters + histograms, increments
+//	curl -s localhost:9090/metrics/usage-gauges  gauges, current values
+//	curl -s localhost:9090/metrics/cumulative    the same per-key metrics, cumulative, for debugging
 package main
 
 import (
@@ -107,7 +121,7 @@ func main() {
 	}, []string{"route"})
 	frameworkReg.MustRegister(routerRequests)
 
-	// Usage metrics: one set per API key.
+	// Per-key metrics: two that accumulate, one that is read as it stands.
 	usageRequests := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "usage_requests_total",
 		Help: "Requests served, by API key.",
@@ -122,27 +136,24 @@ func main() {
 	}, []string{"apikey_id"})
 	usageReg.MustRegister(usageRequests, usageTokens, usageInFlight)
 
-	opts := delta.Options{
-		// Report what accrued since the last delivered scrape. Without this the
-		// exposition is still change-only, but the values are cumulative.
-		ReportIncrements: true,
-		// An instance nothing wrote is not reported at all. Gauges are the
-		// exception: a current value left out is a gap, not a saving, so every
-		// gauge goes out on every scrape.
-		DisableHeartbeat: true,
-		// Drop an instance that has not changed for this many scrapes, so a key
-		// that stops being used stops costing memory. A gauge is only dropped at
-		// zero, so an in-flight count is not deleted mid-request.
-		IdleScrapes: 30,
-		// Stamp the instance's creation time, so a deleted and recreated instance
-		// is a new series rather than a counter that appears to go backwards.
-		// Aggregate this label away downstream: it is there to keep the
-		// arithmetic right on the way in, not to be stored.
-		GenLabel: "gen",
-	}
+	// Increments() is the combination this package recommends for feeding an
+	// aggregator: report what accrued since the last delivered scrape, say
+	// nothing at all about an instance nothing wrote, and let one that has gone
+	// quiet for half an hour go. Assembling it by hand from the eight fields is
+	// how it goes wrong, so it is one call.
+	//
+	// Note what is not here: GenLabel. It belongs to the other scheme, where the
+	// sidecar reports cumulative values and the aggregator differences them --
+	// there a deleted and recreated instance restarts at zero and looks like a
+	// counter reset, and the generation makes it a new series instead. An
+	// increment is already right across a restart, so the label would buy
+	// nothing and would have to be aggregated away again. Setting both panics.
+	opts := delta.Increments()
 
-	framework := delta.New(frameworkReg, opts)
-	usage := delta.NewTracked(trk, opts)
+	counters := delta.NewTracked(trk, opts.WithOnly(delta.Accumulating))
+	gauges := delta.New(usageReg, delta.Options{DisableHeartbeat: true}.WithOnly(delta.Current))
+	cumulative := promhttp.HandlerFor(usageReg, promhttp.HandlerOpts{})
+	framework := promhttp.HandlerFor(frameworkReg, promhttp.HandlerOpts{})
 
 	serve := func(route, key string, n int) {
 		for range n {
@@ -154,44 +165,46 @@ func main() {
 		}
 	}
 
-	// The two endpoints are independent: what one scraper takes is not taken
-	// from the other. Below, the framework endpoint is read three times while
-	// the usage endpoint is read once -- the way a 10s job and a 60s job
-	// interleave -- and the usage scrape still reports every request.
+	// Three framework scrapes to one usage scrape, the way a 10s job and a 60s
+	// job interleave. The framework endpoint is cumulative and consumes nothing,
+	// so the usage scrape that follows still reports every request.
 	serve("/chat", "key-a", 3)
-	show(framework.Handler(), "/metrics", "framework scrape 1 of 3")
+	show(framework, "/metrics", "framework scrape 1 of 3 -- cumulative, consumes nothing")
 
 	serve("/chat", "key-a", 2)
 	serve("/embed", "key-b", 1)
-	show(framework.Handler(), "/metrics", "framework scrape 2 of 3")
+	show(framework, "/metrics", "framework scrape 2 of 3")
 
 	serve("/chat", "key-a", 1)
-	show(framework.Handler(), "/metrics", "framework scrape 3 of 3")
+	show(framework, "/metrics", "framework scrape 3 of 3")
 
-	show(usage.Handler(), "/metrics/usage",
-		"usage scrape: all 7 requests are here, none eaten by the three framework scrapes")
+	show(counters.Handler(), "/metrics/usage",
+		"usage: all 7 requests, none eaten by the framework scrapes -- and no gauge here")
 
-	show(usage.Handler(), "/metrics/usage",
-		"usage scrape with nothing written in between: only the gauges")
+	show(gauges.Handler(), "/metrics/usage-gauges",
+		"gauges: current values only, no counter here")
 
-	cumulative := promhttp.HandlerFor(usageReg, promhttp.HandlerOpts{})
+	show(counters.Handler(), "/metrics/usage",
+		"usage again with nothing written in between: empty, because the gauges went to the other endpoint")
+
 	show(cumulative, "/metrics/cumulative",
 		"a plain cumulative read, for debugging -- touches no baseline")
 
 	serve("/chat", "key-a", 4)
-	show(usage.Handler(), "/metrics/usage",
+	show(counters.Handler(), "/metrics/usage",
 		"the debugging read above did not eat these 4 either")
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", framework.Handler())
-	mux.Handle("/metrics/usage", usage.Handler())
-	// A plain cumulative endpoint, for anything that is not a delta scraper.
+	mux.Handle("/metrics", framework)
+	mux.Handle("/metrics/usage", counters.Handler())
+	mux.Handle("/metrics/usage-gauges", gauges.Handler())
 	mux.Handle("/metrics/cumulative", cumulative)
 
 	fmt.Println("\nserving on :9090")
-	fmt.Println("  /metrics                 framework, increments  -- the 10s job")
-	fmt.Println("  /metrics/usage           usage, increments      -- the 60s job")
-	fmt.Println("  /metrics/cumulative      cumulative, debugging only, touches no baseline")
+	fmt.Println("  /metrics               framework, cumulative        -- the 10s job, scrape config unchanged")
+	fmt.Println("  /metrics/usage         counters + histograms, delta -- sum_samples_total")
+	fmt.Println("  /metrics/usage-gauges  gauges, current values       -- sum_samples")
+	fmt.Println("  /metrics/cumulative    cumulative, debugging only, touches no baseline")
 	log.Fatal(http.ListenAndServe(":9090", mux))
 }
 
