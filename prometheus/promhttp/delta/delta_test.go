@@ -312,3 +312,33 @@ func TestNegotiateEncoding(t *testing.T) {
 		}
 	}
 }
+
+// Once Enable has been called the handlers answer with a delta by default, so
+// that turning this on is a decision the exposing process makes alone and no
+// scrape config has to change. Asking for "0", "false" or "no" gets the
+// cumulative exposition back.
+func TestDeltaIsTheDefaultOnceEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		target string
+		want   bool
+	}{
+		{"/metrics", true},
+		{"/metrics?delta=1", true},
+		{"/metrics?delta=true", true},
+		{"/metrics?delta=yes", true},
+		{"/metrics?other=0", true},
+		{"/metrics?delta=", true},
+		{"/metrics?delta=0", false},
+		{"/metrics?delta=false", false},
+		{"/metrics?delta=no", false},
+	} {
+		if got := requested(httptest.NewRequest("GET", tc.target, nil)); got != tc.want {
+			t.Errorf("%s: delta requested = %v, want %v", tc.target, got, tc.want)
+		}
+	}
+	// A scrape that arrives without a parsed URL is still a delta scrape: the
+	// default cannot depend on being able to read the query.
+	if !requested(nil) {
+		t.Error("a request with no URL should still take the default")
+	}
+}

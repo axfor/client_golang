@@ -59,18 +59,18 @@ func TestDeltaEndpointOffByDefault(t *testing.T) {
 	c.WithLabelValues("a").Add(3)
 	h := HandlerFor(reg, HandlerOpts{})
 
-	if v, ok := value(t, h, "/metrics?delta=1", "delta_off_total"); !ok || v != 3 {
+	if v, ok := value(t, h, "/metrics", "delta_off_total"); !ok || v != 3 {
 		t.Fatalf("first scrape should report the cumulative 3, got %v (present %v)", v, ok)
 	}
 	c.WithLabelValues("a").Add(2)
-	if v, ok := value(t, h, "/metrics?delta=1", "delta_off_total"); !ok || v != 5 {
+	if v, ok := value(t, h, "/metrics", "delta_off_total"); !ok || v != 5 {
 		t.Fatalf("second scrape should report the cumulative 5, got %v (present %v)", v, ok)
 	}
 }
 
 // One call to Enable is the whole setup: the handlers promhttp already hands out
-// answer ?delta=1 with increments, while plain /metrics keeps reporting
-// cumulative values and does not consume them.
+// answer every scrape with increments, so no scrape config changes. ?delta=0
+// asks for the cumulative exposition instead, and does not consume increments.
 func TestDeltaEndpointEnabled(t *testing.T) {
 	delta.Enable(delta.Options{ReportIncrements: true, DisableHeartbeat: true})
 	t.Cleanup(func() {
@@ -85,24 +85,24 @@ func TestDeltaEndpointEnabled(t *testing.T) {
 	h := HandlerFor(reg, HandlerOpts{})
 
 	c.WithLabelValues("a").Add(3)
-	if v, ok := value(t, h, "/metrics?delta=1", "delta_on_total"); !ok || v != 3 {
+	if v, ok := value(t, h, "/metrics", "delta_on_total"); !ok || v != 3 {
 		t.Fatalf("first scrape should report 3, got %v (present %v)", v, ok)
 	}
 	c.WithLabelValues("a").Add(2)
-	if v, ok := value(t, h, "/metrics?delta=1", "delta_on_total"); !ok || v != 2 {
+	if v, ok := value(t, h, "/metrics", "delta_on_total"); !ok || v != 2 {
 		t.Fatalf("second scrape should report the increment 2, got %v (present %v)", v, ok)
 	}
-	if _, ok := value(t, h, "/metrics?delta=1", "delta_on_total"); ok {
+	if _, ok := value(t, h, "/metrics", "delta_on_total"); ok {
 		t.Fatal("a scrape with no writes in between should leave the series out")
 	}
 
-	// Plain /metrics is untouched: still cumulative, and it does not eat the
-	// increments a delta scraper is waiting for.
-	if v, ok := value(t, h, "/metrics", "delta_on_total"); !ok || v != 5 {
-		t.Fatalf("/metrics should report the cumulative 5, got %v (present %v)", v, ok)
+	// ?delta=0 is the ordinary exposition: still cumulative, and it does not eat
+	// the increments the delta scraper is waiting for.
+	if v, ok := value(t, h, "/metrics?delta=0", "delta_on_total"); !ok || v != 5 {
+		t.Fatalf("?delta=0 should report the cumulative 5, got %v (present %v)", v, ok)
 	}
 	c.WithLabelValues("a").Add(4)
-	if v, ok := value(t, h, "/metrics?delta=1", "delta_on_total"); !ok || v != 4 {
-		t.Fatalf("the plain scrape must not consume increments, got %v (present %v)", v, ok)
+	if v, ok := value(t, h, "/metrics", "delta_on_total"); !ok || v != 4 {
+		t.Fatalf("the cumulative scrape must not consume increments, got %v (present %v)", v, ok)
 	}
 }

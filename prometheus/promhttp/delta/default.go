@@ -24,22 +24,25 @@ import (
 // while it is off nothing here costs anything: promhttp's handlers ask one
 // atomic pointer whether it is on.
 //
-// Once enabled, the handlers from promhttp.Handler and promhttp.HandlerFor also
-// answer delta scrapes, so nothing has to be mounted. A scraper asks for one
-// with the delta query parameter:
+// Once enabled, the handlers from promhttp.Handler and promhttp.HandlerFor
+// answer every scrape with a delta one, so neither the exposing process nor the
+// scrape config has anything to mount or set: enabling it here is the whole
+// decision, and /metrics is what the scraper already reads.
 //
-//	/metrics?delta=1
+// The consequence is that /metrics consumes increments, and only one scraper may
+// read it -- a second one, or somebody with curl, takes increments the first one
+// will then never see. Whoever needs the cumulative values instead asks for them
+// explicitly:
 //
-// which every scrape config can add without touching the exposing process:
+//	/metrics?delta=0
 //
-//	params:
-//	  delta: ["1"]
-//
-// Plain /metrics keeps working and keeps reporting cumulative values. It does
-// not consume increments, so it stays usable for debugging next to a delta
-// scraper.
+// which is the ordinary exposition and consumes nothing, so it stays usable for
+// debugging next to a delta scraper.
 
-// QueryParam is the query parameter a scraper sets to ask for a delta scrape.
+// QueryParam is the query parameter that selects the exposition. It is not
+// needed for a delta scrape once Enable has been called -- that is what the
+// handlers do by default -- and "0", "false" or "no" asks for the cumulative
+// exposition instead.
 const QueryParam = "delta"
 
 type server interface {
@@ -89,13 +92,15 @@ func ServeIfRequested(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// requested reports whether this scrape is to be answered with a delta. Once
+// the endpoint is on that is every scrape, unless it opts out.
 func requested(r *http.Request) bool {
 	if r == nil || r.URL == nil {
-		return false
-	}
-	switch r.URL.Query().Get(QueryParam) {
-	case "1", "true", "yes":
 		return true
 	}
-	return false
+	switch r.URL.Query().Get(QueryParam) {
+	case "0", "false", "no":
+		return false
+	}
+	return true
 }
