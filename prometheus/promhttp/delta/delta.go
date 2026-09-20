@@ -221,7 +221,7 @@ type Options struct {
 	// same pattern as a counter and is silently accumulated. With this label the
 	// aggregation is selected by what the metric is:
 	//
-	//	- match: '{_metric_type!="gauge"}'
+	//	- match: '{_metric_type!="gauge",_metric_type!=""}'
 	//	  drop_input_labels: [_metric_type]
 	//	  outputs: [sum_samples_total]
 	//	- match: '{_metric_type="gauge"}'
@@ -229,6 +229,13 @@ type Options struct {
 	//	  outputs: [sum_samples]
 	//
 	// Two rules, written once, that no metric added later changes.
+	//
+	// The _metric_type!="" on the first rule is not redundant: a selector reads
+	// an absent label as empty, so without it the rule also takes every sample
+	// that carries no type at all -- the plain endpoints on the same aggregator,
+	// and everything else it scrapes -- and adds each cumulative value it sees
+	// on top of the last. Every sample from here carries a non-empty type, so
+	// that one condition is exactly "came from a typed endpoint".
 	//
 	// The label is dropped before the aggregator groups, so it does not reach
 	// what is stored. It does travel on the wire: a label repeated on every

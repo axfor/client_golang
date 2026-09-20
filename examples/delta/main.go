@@ -46,7 +46,7 @@
 // TypeLabel puts the type on the sample instead, and the aggregation is then
 // selected by what the metric is:
 //
-//   - match: '{_metric_type!="gauge"}'
+//   - match: '{_metric_type!="gauge",_metric_type!=""}'
 //     drop_input_labels: [_metric_type]
 //     outputs: [sum_samples_total]
 //   - match: '{_metric_type="gauge"}'
@@ -56,6 +56,12 @@
 // Two rules, written once, that no metric added later changes. The label is
 // dropped before the aggregator groups, so it does not reach what is stored, and
 // a label repeated on every sample is 0.2% of a zstd-compressed exposition.
+//
+// The _metric_type!="" is what keeps the first rule from also taking everything
+// that carries no type: a selector reads an absent label as empty, so without it
+// the plain endpoint below -- and every other target on the same aggregator --
+// lands in sum_samples_total, which adds each cumulative value it sees on top of
+// the last.
 //
 // # The endpoints
 //
