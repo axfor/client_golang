@@ -607,3 +607,80 @@ func TestTwoTrackedExposersDrainEachOther(t *testing.T) {
 		t.Errorf("the second exposer saw %d samples; the first one already took them", st.Samples)
 	}
 }
+
+// TypeLabel carries the metric's type on every sample, so an aggregator selects
+// what to do by what the metric is rather than by a list of names somebody
+// maintains. It goes where it sorts, like every label this package adds.
+func TestTypeLabel(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, TypeLabel: "_metric_type"})
+	f.c.WithLabelValues("a").Inc()
+	f.g.WithLabelValues("a").Set(3)
+	f.h.WithLabelValues("a").Observe(1)
+
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	f.exp.Serve(rec, req)
+	body := rec.Body.String()
+
+	want := map[string]string{"c": "counter", "g": "gauge", "h": "histogram"}
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		open := strings.Index(line, "{")
+		if open < 0 {
+			t.Errorf("no labels at all on %q", line)
+			continue
+		}
+		kind := want[line[:1]]
+		if kind == "" {
+			t.Errorf("unexpected series %q", line)
+			continue
+		}
+		if !strings.Contains(line, `_metric_type="`+kind+`"`) {
+			t.Errorf("%q should carry _metric_type=%q", line, kind)
+		}
+		// Sorted: the metric's own label is "key", and "_" sorts before "k".
+		if i := strings.Index(line, "_metric_type="); i > strings.Index(line, "key=") {
+			t.Errorf("the type label is out of sorted order: %q", line)
+		}
+	}
+}
+
+// The type label and the generation coexist, both in their sorted places. The
+// generation is for the scheme that reports cumulative values, so that is the
+// one this uses.
+func TestTypeLabelAlongsideGeneration(t *testing.T) {
+	// The type label is added first and the generation second, so a type label
+	// that sorts after the generation is only placed right if the two are sorted
+	// before being written. Both names are the caller's to choose.
+	f := newTrackedFixture(t, Options{
+		DisableHeartbeat: true, IdleScrapes: 30, GenLabel: "agen", TypeLabel: "ztype",
+	})
+	f.c.WithLabelValues("a").Inc()
+
+	rec := httptest.NewRecorder()
+	f.exp.Serve(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	var line string
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "c") && !strings.HasPrefix(l, "#") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no counter in:\n%s", body)
+	}
+	if !strings.Contains(line, `ztype="counter"`) || !strings.Contains(line, `agen="`) {
+		t.Fatalf("both labels should be there: %q", line)
+	}
+	// "agen" < "key" < "ztype", while the type is added before the generation:
+	// this only holds if the two are sorted before being placed.
+	a := strings.Index(line, "agen=")
+	b := strings.Index(line, "key=")
+	c := strings.Index(line, "ztype=")
+	if !(a < b && b < c) {
+		t.Errorf("labels out of sorted order: %q", line)
+	}
+}

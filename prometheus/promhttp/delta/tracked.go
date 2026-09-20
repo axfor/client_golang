@@ -183,7 +183,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
-	st.Err = encodeFamilies(rs.w, enc, e.buf, e.rows, e.rb.genOf, e.enc, e.opts.GenLabel)
+	st.Err = encodeFamilies(rs.w, enc, e.buf, e.rows, e.rb.genOf, e.enc, e.opts.GenLabel, e.opts.TypeLabel)
 	st.Err, st.Delivered = rs.close(st.Err, r)
 
 	if st.Delivered {

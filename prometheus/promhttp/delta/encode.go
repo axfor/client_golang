@@ -53,8 +53,9 @@ type encState struct {
 	// they are built together and nothing has to be swept later.
 	intern map[string]string
 
-	buf []byte // scratch for building one label string
-	num []byte // scratch for formatting one value
+	buf   []byte        // scratch for building one label string
+	num   []byte        // scratch for formatting one value
+	extra [2]extraLabel // the generation and the type, reused per family
 }
 
 func newEncState() *encState {
@@ -73,18 +74,18 @@ func (es *encState) share(b []byte) string {
 
 // encodeFamilies writes the families of one scrape. rows[i] holds the entries
 // behind buf[i].Metric, in the same order, and carries the cached labels.
-func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, es *encState, genLabel string) error {
+func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, es *encState, genLabel, typeLabel string) error {
 	defer clear(es.intern)
 	for i, mf := range buf {
 		if len(mf.Metric) == 0 {
 			continue
 		}
-		sh := cacheLabels(mf, rows[i], gen, es, genLabel)
+		sh := cacheLabels(mf, rows[i], gen, es, genLabel, typeLabel)
 		if sh == nil {
 			// expfmt renders from the dto, so the generation has to go on it here.
 			// It cannot be decided earlier: whether this encoder takes a family is
 			// only known once every metric of it is in.
-			stampFallback(mf, rows[i], gen, genLabel)
+			stampFallback(mf, rows[i], gen, genLabel, typeLabel)
 			if err := enc.Encode(mf); err != nil {
 				return err
 			}
@@ -183,7 +184,7 @@ func leFragment(v float64) []byte {
 
 // cacheLabels makes sure every entry of a family has its rendered labels, and
 // returns the shape the family writes with, or nil when expfmt has to take over.
-func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es *encState, genLabel string) *familyShape {
+func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es *encState, genLabel, typeLabel string) *familyShape {
 	if len(rows) != len(mf.Metric) || !handled(mf) {
 		return nil
 	}
@@ -197,6 +198,26 @@ func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es
 	default:
 		genLabel = ""
 	}
+	// The type is the family's, so the label that carries it is built once here
+	// rather than per series.
+	extra := es.extra[:0]
+	if typeLabel != "" {
+		extra = append(extra, extraLabel{typeLabel, typeName(mf.GetType())})
+	}
+	genAt := -1
+	if genLabel != "" {
+		genAt = len(extra)
+		extra = append(extra, extraLabel{genLabel, ""})
+	}
+	sortExtra(extra)
+	if genAt >= 0 {
+		for i := range extra {
+			if extra[i].name == genLabel {
+				genAt = i
+			}
+		}
+	}
+
 	var sh *familyShape
 	for j, m := range mf.Metric {
 		en := rows[j]
@@ -215,7 +236,10 @@ func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es
 		if en.rendered != "" && en.renderedGen == g {
 			continue
 		}
-		rendered, ok := buildLabels(es.buf[:0], m, genLabel, g)
+		if genAt >= 0 {
+			extra[genAt].value = strconv.FormatInt(g, 10)
+		}
+		rendered, ok := buildLabels(es.buf[:0], m, extra)
 		if !ok {
 			return nil
 		}
@@ -227,17 +251,23 @@ func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es
 
 // stampFallback puts the generation label on a family expfmt is about to render.
 // Gauges never carry it, and neither does a family with no entries behind it.
-func stampFallback(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, genLabel string) {
-	if genLabel == "" || len(rows) != len(mf.Metric) {
+func stampFallback(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, genLabel, typeLabel string) {
+	if (genLabel == "" && typeLabel == "") || len(rows) != len(mf.Metric) {
 		return
 	}
-	switch mf.GetType() {
-	case dto.MetricType_COUNTER, dto.MetricType_HISTOGRAM:
-	default:
+	genKinds := mf.GetType() == dto.MetricType_COUNTER || mf.GetType() == dto.MetricType_HISTOGRAM
+	if !genKinds && typeLabel == "" {
 		return
 	}
 	for j, m := range mf.Metric {
-		if en := rows[j]; en != nil {
+		en := rows[j]
+		if en == nil {
+			continue
+		}
+		if typeLabel != "" {
+			applyLabel(m, typeLabel, typeName(mf.GetType()))
+		}
+		if genKinds && genLabel != "" {
 			applyGen(m, genLabel, gen(en))
 		}
 	}
@@ -248,10 +278,17 @@ func stampFallback(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, 
 // value written into it in place would change the metric itself; the slice is
 // rebuilt instead.
 func applyGen(m *dto.Metric, name string, gen int64) {
-	value := strconv.FormatInt(gen, 10)
-	n := name
+	applyLabel(m, name, strconv.FormatInt(gen, 10))
+}
+
+// applyLabel puts one label on a metric in its sorted place, replacing a label
+// of that name if the metric carries one. Write hands out the metric's own
+// label slice, so a value written into it in place would change the metric
+// itself; the slice is rebuilt instead.
+func applyLabel(m *dto.Metric, name, value string) {
+	n, v := name, value
 	at, replace := genIndex(m.Label, name)
-	m.Label = withLabel(m.Label, &dto.LabelPair{Name: &n, Value: &value}, at, replace)
+	m.Label = withLabel(m.Label, &dto.LabelPair{Name: &n, Value: &v}, at, replace)
 }
 
 // withLabel returns labels with lp at index at, dropping what is there when the
@@ -298,37 +335,59 @@ func bucketsOf(m *dto.Metric) []*dto.Bucket {
 // The generation label is appended here rather than put on the dto: this is the
 // only place it is needed for a family written from the cache, and keeping it
 // out of the dto saves a label slice per series.
-func buildLabels(dst []byte, m *dto.Metric, genLabel string, gen int64) ([]byte, bool) {
+func buildLabels(dst []byte, m *dto.Metric, extra []extraLabel) ([]byte, bool) {
 	for _, lp := range m.Label {
 		if !model.LegacyValidation.IsValidLabelName(lp.GetName()) {
 			return nil, false
 		}
 	}
-	if len(m.Label) == 0 && genLabel == "" {
+	if len(m.Label) == 0 && len(extra) == 0 {
 		return dst, true
 	}
 	sep := byte('{')
-	at, replace := genIndex(m.Label, genLabel)
-	for i, lp := range m.Label {
-		if i == at {
-			dst = appendGen(dst, sep, genLabel, gen)
-			sep = ','
-			if replace {
-				continue // the metric's own label of that name is the one replaced
-			}
-		}
+	next := 0 // the extra label to place before the metric's own labels from here
+	write := func(name, value string) {
 		dst = append(dst, sep)
-		dst = append(dst, lp.GetName()...)
+		dst = append(dst, name...)
 		dst = append(dst, '=', '"')
-		dst = appendEscaped(dst, lp.GetValue(), true)
+		dst = appendEscaped(dst, value, true)
 		dst = append(dst, '"')
 		sep = ','
 	}
-	if at == len(m.Label) {
-		dst = appendGen(dst, sep, genLabel, gen)
+	for _, lp := range m.Label {
+		name := lp.GetName()
+		replaced := false
+		for next < len(extra) && extra[next].name <= name {
+			write(extra[next].name, extra[next].value)
+			if extra[next].name == name {
+				replaced = true // the metric's own label of that name gives way
+			}
+			next++
+		}
+		if !replaced {
+			write(name, lp.GetValue())
+		}
+	}
+	for ; next < len(extra); next++ {
+		write(extra[next].name, extra[next].value)
 	}
 	return dst, true
 }
+
+// sortExtra orders the extra labels by name. There are at most two.
+func sortExtra(e []extraLabel) {
+	for i := 1; i < len(e); i++ {
+		for j := i; j > 0 && e[j].name < e[j-1].name; j-- {
+			e[j], e[j-1] = e[j-1], e[j]
+		}
+	}
+}
+
+// extraLabel is a label this package puts on a series that the metric does not
+// carry itself. They are placed in sorted order among the metric's own labels,
+// which Write hands out sorted, so a consumer that sorts what it receives has
+// nothing to move.
+type extraLabel struct{ name, value string }
 
 // genIndex says where the generation label belongs among a metric's own labels,
 // which Write hands out sorted by name, and whether one of that name is already

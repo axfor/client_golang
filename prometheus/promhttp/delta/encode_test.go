@@ -110,7 +110,7 @@ func TestEncodeMatchesExpfmt(t *testing.T) {
 			var got bytes.Buffer
 			w := bufio.NewWriter(&got)
 			enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
-			if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows}, func(*entry) int64 { return 0 }, newEncState(), ""); err != nil {
+			if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows}, func(*entry) int64 { return 0 }, newEncState(), "", ""); err != nil {
 				t.Fatal(err)
 			}
 			w.Flush()
@@ -141,7 +141,7 @@ func TestEncodeRebuildsOnGenerationChange(t *testing.T) {
 		var out bytes.Buffer
 		w := bufio.NewWriter(&out)
 		enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
-		if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{en}}, func(*entry) int64 { return gen }, shapes, "gen"); err != nil {
+		if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{en}}, func(*entry) int64 { return gen }, shapes, "gen", ""); err != nil {
 			t.Fatal(err)
 		}
 		w.Flush()
@@ -175,7 +175,7 @@ func TestFallbackKeepsGeneration(t *testing.T) {
 	w := bufio.NewWriter(&out)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
-		func(en *entry) int64 { return en.born }, newEncState(), "gen"); err != nil {
+		func(en *entry) int64 { return en.born }, newEncState(), "gen", ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
@@ -208,7 +208,7 @@ func TestMismatchedBucketLayoutFallsBack(t *testing.T) {
 	w := bufio.NewWriter(&got)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
-		func(*entry) int64 { return 0 }, newEncState(), ""); err != nil {
+		func(*entry) int64 { return 0 }, newEncState(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
@@ -242,7 +242,7 @@ func TestSameBucketCountDifferentBoundsFallsBack(t *testing.T) {
 	w := bufio.NewWriter(&got)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{rows},
-		func(*entry) int64 { return 0 }, newEncState(), ""); err != nil {
+		func(*entry) int64 { return 0 }, newEncState(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
@@ -287,7 +287,7 @@ func TestGenerationLabelIsSorted(t *testing.T) {
 				w := bufio.NewWriter(&out)
 				enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 				if err := encodeFamilies(w, enc, []*dto.MetricFamily{mf}, [][]*entry{{{born: 7}}},
-					func(en *entry) int64 { return en.born }, newEncState(), "gen"); err != nil {
+					func(en *entry) int64 { return en.born }, newEncState(), "gen", ""); err != nil {
 					t.Fatal(err)
 				}
 				w.Flush()
@@ -316,7 +316,7 @@ func TestLabelsAreSharedBetweenFamilies(t *testing.T) {
 	w := bufio.NewWriter(&out)
 	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	es := newEncState()
-	if err := encodeFamilies(w, enc, mfs, rows, func(en *entry) int64 { return en.born }, es, "gen"); err != nil {
+	if err := encodeFamilies(w, enc, mfs, rows, func(en *entry) int64 { return en.born }, es, "gen", ""); err != nil {
 		t.Fatal(err)
 	}
 	w.Flush()
