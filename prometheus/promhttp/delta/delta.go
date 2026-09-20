@@ -61,6 +61,69 @@ type Logger interface {
 	Println(v ...any)
 }
 
+// Kind selects what an exposition carries, so that two endpoints over the same
+// metrics can be aggregated differently without the aggregator having to be told
+// which metric is which.
+//
+// A consumer adds up what a counter or a histogram reports and reads a gauge as
+// it stands, which are different operations, and the exposition format carries
+// no type for the aggregator to switch on -- it has to be told, by name, and the
+// list has to be kept up to date as metrics are added. Serving the two kinds at
+// two endpoints moves that knowledge back to where it is known: a metric added
+// later lands on the right endpoint by its own type, and the aggregator picks
+// the arithmetic by which endpoint it scraped.
+type Kind int
+
+const (
+	// Everything is the default: one endpoint with all of it.
+	Everything Kind = iota
+	// Accumulating carries counters, histograms, summaries and untyped values --
+	// what a consumer adds up.
+	Accumulating
+	// Current carries gauges -- what a consumer reads as it stands.
+	Current
+)
+
+// carries reports whether this exposition takes a metric of this type.
+func (k Kind) carries(t dto.MetricType) bool {
+	switch k {
+	case Accumulating:
+		return t != dto.MetricType_GAUGE
+	case Current:
+		return t == dto.MetricType_GAUGE
+	}
+	return true
+}
+
+// Increments returns the options this package recommends for feeding an
+// aggregator: report what accrued since the last delivered scrape, say nothing
+// at all about an instance nothing wrote, and let an instance that has gone
+// quiet for half an hour go.
+//
+//	exp := delta.NewTracked(trk, delta.Increments())
+//
+// There is one right combination for that job and assembling it by hand is how
+// it goes wrong, so it is one call. Change a field on the result where a
+// deployment really differs -- a scrape interval that is not 60s makes
+// IdleScrapes mean a different span of time.
+func Increments() Options {
+	return Options{
+		ReportIncrements: true,
+		DisableHeartbeat: true,
+		IdleScrapes:      30,
+	}
+}
+
+// WithOnly returns these options limited to one kind of metric, for the second
+// of a pair of endpoints:
+//
+//	counters := delta.NewTracked(trk, delta.Increments().WithOnly(delta.Accumulating))
+//	gauges   := delta.New(reg, delta.Options{DisableHeartbeat: true}.WithOnly(delta.Current))
+func (o Options) WithOnly(k Kind) Options {
+	o.Only = k
+	return o
+}
+
 // Options controls the exposition. The zero value is change-only, a three-scrape
 // heartbeat, and no idle deletion.
 type Options struct {
@@ -129,6 +192,10 @@ type Options struct {
 	// one scrape interval.
 	RebaseAfterGap time.Duration
 
+	// Only limits what this exposition carries, so that the kinds needing
+	// different aggregation can be scraped separately. The default carries
+	// everything. See Kind.
+	Only Kind
 	// Gatherer selects the slower path that reads through a Gatherer instead of
 	// change tracking. Enable uses it when change tracking cannot be turned on
 	// early enough, for instance when metrics already exist.
@@ -229,10 +296,16 @@ func check(opts Options) Options {
 	if opts.RebaseAfterGap > 0 && opts.GenLabel == "" {
 		panic("delta: RebaseAfterGap requires GenLabel")
 	}
+	if opts.ReportIncrements && opts.GenLabel != "" {
+		panic("delta: ReportIncrements and GenLabel are mutually exclusive; an increment is already right across a restart or a deletion, so the generation buys nothing and has to be aggregated away again")
+	}
 	if opts.ReportIncrements && opts.RebaseAfterGap > 0 {
 		panic("delta: ReportIncrements and RebaseAfterGap are mutually exclusive; reporting increments needs no generation change")
 	}
-	if opts.DisableHeartbeat && !opts.ReportIncrements && (opts.IdleScrapes <= 0 || opts.GenLabel == "") {
+	// A gauge is never differenced, so an idle one the aggregator has forgotten
+	// cannot be counted twice -- the check below is about accumulated values and
+	// does not apply to an exposition that carries none.
+	if opts.Only != Current && opts.DisableHeartbeat && !opts.ReportIncrements && (opts.IdleScrapes <= 0 || opts.GenLabel == "") {
 		panic("delta: DisableHeartbeat without ReportIncrements requires IdleScrapes > 0 and GenLabel, or an idle instance the aggregator has forgotten is counted twice")
 	}
 	return opts
@@ -292,6 +365,9 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 // what to commit once the response is delivered.
 func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pending []pendingCommit, heartbeat int) {
 	for _, mf := range mfs {
+		if !e.opts.Only.carries(mf.GetType()) {
+			continue
+		}
 		kept := mf.Metric[:0]
 		for _, m := range mf.Metric {
 			e.keyBuf = appendSeriesKey(e.keyBuf[:0], mf.GetName(), m.Label)

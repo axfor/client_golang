@@ -25,7 +25,7 @@ import (
 // deleted as idle and written to again is a different series. Gauges never
 // carry it.
 func TestGenLabel(t *testing.T) {
-	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, GenLabel: "gen", IdleScrapes: 2, HeartbeatScrapes: 1})
+	f := newTrackedFixture(t, Options{DisableHeartbeat: true, GenLabel: "gen", IdleScrapes: 2, HeartbeatScrapes: 1})
 	now := time.Unix(1000, 0)
 	f.exp.rb.now = func() time.Time { return now }
 
@@ -156,7 +156,7 @@ func TestOptionsAreChecked(t *testing.T) {
 func TestDeleteCallbackGetsLabelsWithoutGeneration(t *testing.T) {
 	var got []prometheus.Labels
 	f := newTrackedFixture(t, Options{
-		ReportIncrements: true, DisableHeartbeat: true, GenLabel: "gen",
+		DisableHeartbeat: true, GenLabel: "gen",
 		IdleScrapes: 2, HeartbeatScrapes: 1,
 		Delete: func(_ string, labels prometheus.Labels) { got = append(got, labels) },
 	})

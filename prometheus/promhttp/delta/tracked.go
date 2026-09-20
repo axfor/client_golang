@@ -155,7 +155,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	// Gauges are current values: one left out is a gap for the consumer, not a
 	// saving, so every gauge goes out every scrape regardless of DisableHeartbeat.
 	// This is what the Gather path does too, see Exposer.decide.
-	for i := 0; i < len(e.gauges); {
+	for i := 0; e.opts.Only.carries(dto.MetricType_GAUGE) && i < len(e.gauges); {
 		m := e.gauges[i]
 		en := e.state[m]
 		if en == nil { // dropped as idle; a new child registers itself again
@@ -231,6 +231,9 @@ func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingComm
 		e.lent = append(e.lent, loan{name, out})
 	} else if err := m.Write(out); err != nil {
 		return nil, false
+	}
+	if typ := metricType(out); typ == nil || !e.opts.Only.carries(*typ) {
+		return nil, true // not this endpoint's kind; nothing taken, nothing lost
 	}
 	mf, idx := e.family(desc, out, en)
 	if mf == nil {

@@ -449,7 +449,7 @@ func TestDTOsAreLentPerScrapeNotPerInstance(t *testing.T) {
 // one per instance: that is 96 bytes on every series, which is what moving them
 // out of the entry was for.
 func TestNoSideStructWhenNothingNeedsOne(t *testing.T) {
-	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, GenLabel: "gen"})
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true})
 	for i := range 50 {
 		f.c.WithLabelValues(strconv.Itoa(i)).Inc()
 		f.h.WithLabelValues(strconv.Itoa(i)).Observe(1)
@@ -501,5 +501,109 @@ func TestSideStructAppearsOnceTheGenerationMoves(t *testing.T) {
 		if en.extra == nil {
 			t.Error("the generation moved and the entry has nowhere to keep its base")
 		}
+	}
+}
+
+// Two endpoints over the same metrics, split by what a consumer does with them:
+// one carries what it adds up, the other what it reads as it stands. An
+// aggregator then picks the arithmetic by which endpoint it scraped, instead of
+// being handed a list of metric names that has to be kept up to date.
+func TestKindSplitsTheExposition(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, Only: Accumulating})
+	// The gauge endpoint gathers rather than tracks: the dirty list is one list,
+	// and a second tracked exposer would drain it from the first. See
+	// TestTwoTrackedExposersDrainEachOther.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(f.c, f.g, f.h)
+	gauges := New(reg, Options{DisableHeartbeat: true, Only: Current})
+
+	f.c.WithLabelValues("a").Add(5)
+	f.h.WithLabelValues("a").Observe(1)
+	f.g.WithLabelValues("a").Set(7)
+
+	acc, _ := f.scrape(t, false)
+	for name := range acc {
+		if strings.HasPrefix(name, "g{") {
+			t.Errorf("the accumulating endpoint carried a gauge: %v", acc)
+		}
+	}
+	if acc[`c_total{key=a}`] != 5 {
+		t.Errorf("counter = %v, want 5: %v", acc[`c_total{key=a}`], acc)
+	}
+
+	req := httptest.NewRequest("GET", "/metrics/gauges", nil)
+	rec := httptest.NewRecorder()
+	gauges.Serve(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "g") || !strings.Contains(body, "7") {
+		t.Errorf("the current-value endpoint should carry the gauge:\n%s", body)
+	}
+	for _, name := range []string{"c_total", "h_sum", "h_count"} {
+		if strings.Contains(body, name) {
+			t.Errorf("the current-value endpoint carried %s:\n%s", name, body)
+		}
+	}
+}
+
+// A metric added later lands on the right endpoint by its own type, which is
+// the point: no list of names anywhere has to be updated.
+func TestAMetricAddedLaterLandsOnTheRightEndpoint(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, Only: Accumulating})
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(f.c, f.g, f.h)
+	gauges := New(reg, Options{DisableHeartbeat: true, Only: Current})
+	f.c.WithLabelValues("a").Inc()
+	f.scrape(t, false)
+	gauges.Serve(httptest.NewRecorder(), httptest.NewRequest("GET", "/g", nil))
+
+	// Two new metrics, one of each kind, created after both endpoints exist.
+	suffix := strconv.Itoa(rand.Int())
+	late := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "late" + suffix + "_total", Help: "c"}, []string{"key"})
+	lateG := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "lateg" + suffix, Help: "g"}, []string{"key"})
+	reg.MustRegister(late, lateG)
+	late.WithLabelValues("a").Add(3)
+	lateG.WithLabelValues("a").Set(9)
+
+	acc, _ := f.scrape(t, false)
+	accHas := false
+	for name := range acc {
+		if strings.HasPrefix(name, "late_total{") {
+			accHas = true
+		}
+		if strings.HasPrefix(name, "lateg{") {
+			t.Errorf("the new gauge landed on the accumulating endpoint: %v", acc)
+		}
+	}
+	if !accHas {
+		t.Errorf("the new counter did not land on the accumulating endpoint: %v", acc)
+	}
+
+	rec := httptest.NewRecorder()
+	gauges.Serve(rec, httptest.NewRequest("GET", "/g", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "lateg"+suffix) {
+		t.Errorf("the new gauge did not land on the current-value endpoint:\n%s", body)
+	}
+	if strings.Contains(body, "late"+suffix+"_total") {
+		t.Errorf("the new counter landed on the current-value endpoint:\n%s", body)
+	}
+}
+
+// Why the gauge endpoint gathers instead of tracking: the dirty list is one
+// list, and whichever tracked exposer scrapes first takes it. This is the
+// constraint behind "the big one is tracked, the small ones gather".
+func TestTwoTrackedExposersDrainEachOther(t *testing.T) {
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true})
+	second := NewTracked(f.trk, Options{ReportIncrements: true, DisableHeartbeat: true})
+
+	f.c.WithLabelValues("a").Add(5)
+	if got, _ := f.scrape(t, false); got[`c_total{key=a}`] != 5 {
+		t.Fatalf("the first exposer should report the 5: %v", got)
+	}
+
+	rec := httptest.NewRecorder()
+	st := second.Serve(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if st.Samples != 0 {
+		t.Errorf("the second exposer saw %d samples; the first one already took them", st.Samples)
 	}
 }

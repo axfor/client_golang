@@ -62,7 +62,7 @@ func BenchmarkTrackedServe(b *testing.B) {
 					g.WithLabelValues(ids[i], "z").Set(float64(i % 7))
 					h.WithLabelValues(ids[i], "z").Observe(float64(i % 300))
 				}
-				exp := NewTracked(trk, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 30, GenLabel: "gen"})
+				exp := NewTracked(trk, Increments())
 				req := httptest.NewRequest("GET", "/metrics/delta", nil)
 				exp.Serve(&discard{}, req) // drain what start-up left pending
 
