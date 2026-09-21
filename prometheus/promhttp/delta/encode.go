@@ -56,6 +56,11 @@ type encState struct {
 	buf   []byte        // scratch for building one label string
 	num   []byte        // scratch for formatting one value
 	extra [2]extraLabel // the generation and the type, reused per family
+
+	// Recent high-water mark of what intern held in one scrape. Clearing a map
+	// releases the entries but keeps the buckets, and this one is sized by the
+	// first scrape after start-up, when every instance is new and so is written.
+	internPeak int
 }
 
 func newEncState() *encState {
@@ -72,10 +77,34 @@ func (es *encState) share(b []byte) string {
 	return s
 }
 
+// resetIntern empties the label table for the next scrape, and gives its
+// buckets back once a scrape uses far fewer than the largest one did. A Go map
+// never returns them on its own: after idle cleanup the table is still sized
+// for every instance the process had.
+func (es *encState) resetIntern() {
+	n := len(es.intern)
+	if n > es.internPeak {
+		es.internPeak = n
+		clear(es.intern)
+		return
+	}
+	es.internPeak -= es.internPeak / 8
+	// The current length says nothing about the buckets: after idle cleanup a
+	// scrape interns a handful while the table is still sized for a million. It
+	// is the mark that has to be compared, and it only falls once the scrapes
+	// behind it do.
+	if es.internPeak >= minShrink && n < es.internPeak/2 {
+		es.intern = make(map[string]string, es.internPeak+es.internPeak/4+1)
+		es.internPeak = n
+		return
+	}
+	clear(es.intern)
+}
+
 // encodeFamilies writes the families of one scrape. rows[i] holds the entries
 // behind buf[i].Metric, in the same order, and carries the cached labels.
 func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, es *encState, genLabel, typeLabel string) error {
-	defer clear(es.intern)
+	defer es.resetIntern()
 	for i, mf := range buf {
 		if len(mf.Metric) == 0 {
 			continue

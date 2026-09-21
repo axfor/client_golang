@@ -70,9 +70,12 @@ type TrackedExposer struct {
 	byName map[string]int // family name to its index in buf
 	enc    *encState
 
-	// Recent high-water mark of len(state), so the map can be given back
-	// after idle cleanup instead of staying at the size it once needed.
+	// Recent high-water marks, so the arrays behind these can be given back
+	// after idle cleanup instead of staying at the size they once needed.
 	statePeak int
+	takenPeak int
+	lentPeak  int
+	rowPeak   []int
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -105,6 +108,33 @@ func (e *TrackedExposer) Tracked() int {
 	return len(e.state)
 }
 
+// minShrink is the capacity below which giving an array back is not worth the
+// copy.
+const minShrink = 1 << 6
+
+// fallBack returns a slice with room for about peak elements when the one it is
+// given is holding an array far larger. Clearing a slice releases what it
+// pointed at but keeps the array, and these are all sized by the first scrape
+// after start-up, when every instance in the process is new and so is written.
+// The mark it is given decays, the way the dto free lists do, so a burst is let
+// go over a few scrapes while a steady load never reallocates.
+func fallBack[T any](s []T, peak int) []T {
+	if cap(s) < minShrink || cap(s) < 4*(peak+1) {
+		return s
+	}
+	return make([]T, 0, peak+peak/4+1)
+}
+
+// decay moves a high-water mark towards n, dropping an eighth of the way when n
+// is below it.
+func decay(mark *int, n int) {
+	if n > *mark {
+		*mark = n
+		return
+	}
+	*mark -= *mark / 8
+}
+
 // Handler returns an http.Handler.
 func (e *TrackedExposer) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { e.Serve(w, r) })
@@ -128,6 +158,10 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	for i := range e.rows {
 		r := e.rows[i]
 		clear(r[:cap(r)])
+		if i < len(e.rowPeak) {
+			decay(&e.rowPeak[i], len(r))
+			r = fallBack(r, e.rowPeak[i])
+		}
 		e.rows[i] = r[:0]
 	}
 	e.buf = e.buf[:0]
@@ -224,7 +258,8 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	// Same as e.rows above: these are live instances, and holding them past the
 	// scrape keeps everything they reference.
 	clear(taken[:cap(taken)])
-	e.taken = taken[:0]
+	decay(&e.takenPeak, len(taken))
+	e.taken = fallBack(taken, e.takenPeak)[:0]
 	st.Deleted = e.drop(idle)
 	return st
 }
@@ -305,6 +340,7 @@ func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric, en *entry)
 		e.buf = append(e.buf, &dto.MetricFamily{Name: &name, Help: &help, Type: typ})
 		if idx == len(e.rows) {
 			e.rows = append(e.rows, nil)
+			e.rowPeak = append(e.rowPeak, 0)
 		}
 		e.rows[idx] = e.rows[idx][:0]
 		e.byName[name] = idx
@@ -349,7 +385,8 @@ func (e *TrackedExposer) returnAll() {
 		used[l.family]++
 		e.lent[i].m = nil
 	}
-	e.lent = e.lent[:0]
+	decay(&e.lentPeak, len(e.lent))
+	e.lent = fallBack(e.lent, e.lentPeak)[:0]
 	for family, l := range e.free {
 		mark := e.peak[family] - e.peak[family]/8
 		if used[family] > mark {
@@ -358,7 +395,16 @@ func (e *TrackedExposer) returnAll() {
 		e.peak[family] = mark
 		if keep := mark + mark/4; len(l) > keep {
 			clear(l[keep:])
-			e.free[family] = l[:keep]
+			l = l[:keep]
+			// Truncating releases the dtos past keep but not the array holding
+			// them, which the first scrape after start-up sized to every
+			// instance in the process.
+			if f := fallBack(l, keep); cap(f) != cap(l) {
+				f = f[:len(l)]
+				copy(f, l)
+				l = f
+			}
+			e.free[family] = l
 		}
 	}
 }
