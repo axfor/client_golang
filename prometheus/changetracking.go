@@ -73,13 +73,34 @@ func (d *dirtyState) mark() {
 }
 
 type dirtyShard struct {
-	mu    sync.Mutex
-	epoch atomic.Uint32
-	dirty []*dirtyState
-	spare []*dirtyState // backing array of the previous batch, reused
+	mu        sync.Mutex
+	epoch     atomic.Uint32
+	dirty     []*dirtyState
+	spare     []*dirtyState // backing array of the previous batch, reused
+	batchPeak int           // recent high-water mark of a batch, so spare can fall back
 
-	allMu sync.RWMutex
-	all   []*dirtyState // every instance on this shard, for heartbeats and idle cleanup
+	allMu   sync.RWMutex
+	all     []*dirtyState // every instance on this shard, for heartbeats and idle cleanup
+	allPeak int           // recent high-water mark of len(all), so it can fall back
+}
+
+// Neither of these slices is worth reallocating below this.
+const minShrinkSlice = 1 << 6
+
+// shrunk returns a slice holding the same elements with room for want more,
+// when the one it is given is holding an array far larger than that. A slice
+// that grew to fit every instance the process had keeps that array after the
+// elements are gone: the pointers are cleared, so nothing is retained through
+// them, but the array itself stays for the life of the process. Across the
+// shards here that was 18MB of the 310MB live heap at 30k keys with 2k of them
+// active.
+func shrunk(s []*dirtyState, want int) []*dirtyState {
+	if cap(s) < minShrinkSlice || cap(s) < 4*(want+1) {
+		return s
+	}
+	fresh := make([]*dirtyState, len(s), want+want/4+1)
+	copy(fresh, s)
+	return fresh
 }
 
 func (s *dirtyShard) add(d *dirtyState) {
@@ -186,6 +207,12 @@ func untrackMetric(m Metric) {
 		s.all[d.idx].idx = d.idx
 		s.all[last] = nil
 		s.all = s.all[:last]
+		if n := len(s.all); n > s.allPeak {
+			s.allPeak = n
+		} else {
+			s.allPeak -= s.allPeak / 8
+			s.all = shrunk(s.all, s.allPeak)
+		}
 	}
 	s.allMu.Unlock()
 	d.owner = nil
@@ -248,8 +275,13 @@ func (t *ChangeTracker) Take(fn func(Metric)) {
 
 		s.mu.Lock()
 		if s.spare == nil {
+			if n := len(taken); n > s.batchPeak {
+				s.batchPeak = n
+			} else {
+				s.batchPeak -= s.batchPeak / 8
+			}
 			clear(taken)
-			s.spare = taken[:0]
+			s.spare = shrunk(taken[:0], s.batchPeak)
 		}
 		s.mu.Unlock()
 	}
@@ -283,4 +315,25 @@ func (t *ChangeTracker) RangeBucket(bucket, buckets int, fn func(Metric)) {
 		}
 		s.allMu.RUnlock()
 	}
+}
+
+// TrackerCapacity reports how many entries the tracker's per-shard slices have
+// room for. It exists for tests: the slices hold pointers that are cleared on
+// removal, so the only way to see whether the arrays behind them were given
+// back is to look at the capacity.
+func TrackerCapacity(t *ChangeTracker) int {
+	if t == nil {
+		return 0
+	}
+	total := 0
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.allMu.RLock()
+		total += cap(s.all)
+		s.allMu.RUnlock()
+		s.mu.Lock()
+		total += cap(s.dirty) + cap(s.spare)
+		s.mu.Unlock()
+	}
+	return total
 }
