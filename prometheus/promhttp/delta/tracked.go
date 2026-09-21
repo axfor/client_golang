@@ -164,6 +164,10 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 		}
 		e.rows[i] = r[:0]
 	}
+	// Same as e.rows: a stale *dto.MetricFamily past the length keeps its whole
+	// Metric slice, and those dtos stay alive after the free list has trimmed
+	// them.
+	clear(e.buf[:cap(e.buf)])
 	e.buf = e.buf[:0]
 	clear(e.byName)
 	var pending []pendingCommit
@@ -460,7 +464,10 @@ func (e *TrackedExposer) shrinkState() {
 		e.statePeak = n
 		return
 	}
-	e.statePeak -= e.statePeak / 8
+	// The mark does not decay. A population that drains gradually still has to
+	// be given back, and a mark that falls as fast as the drain is re-pinned
+	// every scrape and never gets two times above it -- only a collapse inside
+	// one scrape would ever fire. It resets on the rebuild below instead.
 	if len(e.state) >= e.statePeak/2 || e.statePeak < minShrinkState {
 		return
 	}

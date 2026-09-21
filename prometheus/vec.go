@@ -386,8 +386,13 @@ func (m *metricMap) Reset() {
 			untrackMetric(mwlv.metric)
 		}
 		delete(m.metrics, h)
-		m.shrink()
 	}
+	// Not inside the loop: shrink rebuilds once the map is half empty, and the
+	// loop empties it, so a Vec with a million children would rebuild about
+	// eight times and throw each one away on the next pass. Everything is gone
+	// by here, so hand back a fresh map rather than one sized for what was.
+	m.metrics = map[uint64][]metricWithLabelValues{}
+	m.peak = 0
 }
 
 // deleteByHashWithLabelValues removes the metric from the hash bucket h. If

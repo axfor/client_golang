@@ -88,13 +88,15 @@ func (es *encState) resetIntern() {
 		clear(es.intern)
 		return
 	}
-	es.internPeak -= es.internPeak / 8
-	// The current length says nothing about the buckets: after idle cleanup a
-	// scrape interns a handful while the table is still sized for a million. It
-	// is the mark that has to be compared, and it only falls once the scrapes
-	// behind it do.
+	// The mark is the largest this table has held since it was last built, and
+	// it does not decay: a table that fills gradually and then drains gradually
+	// still has to be given back, and a mark that decays as fast as the drain
+	// is re-pinned every scrape and never gets two times above it.
+	//
+	// The replacement is sized from what is there now, not from the mark. Sizing
+	// it from the mark rebuilds the table at the size it is being replaced for.
 	if es.internPeak >= minShrink && n < es.internPeak/2 {
-		es.intern = make(map[string]string, es.internPeak+es.internPeak/4+1)
+		es.intern = make(map[string]string, n+n/4+1)
 		es.internPeak = n
 		return
 	}
