@@ -493,32 +493,24 @@ func (r *Registry) gather(keep func(fqName string) bool) ([]*dto.MetricFamily, e
 		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
 	)
 
-	// Decide which checked collectors are worth walking before walking any of
-	// them. This is the whole point of GatherFiltered: Collect on a Vec with a
-	// million children costs a million dto allocations, and no filter applied
-	// to the result can give that back.
-	wanted := make([]Collector, 0, len(r.collectorsByID))
+	// Snapshot what the decision needs, then let go of the lock before calling
+	// keep. RUnlock below is not deferred, so a keep that panics -- or that
+	// reaches back into the registry -- would otherwise leave the registry
+	// read-locked for the life of the process.
+	checked := make([]Collector, 0, len(r.collectorsByID))
+	var checkedNames [][]string
+	if keep != nil {
+		checkedNames = make([][]string, 0, len(r.collectorsByID))
+	}
 	for id, collector := range r.collectorsByID {
-		if keep != nil && !keepsAnyName(r.namesByCollectorID[id], keep) {
-			continue
+		checked = append(checked, collector)
+		if keep != nil {
+			checkedNames = append(checkedNames, r.namesByCollectorID[id])
 		}
-		wanted = append(wanted, collector)
 	}
-	if len(wanted) == 0 && len(r.uncheckedCollectors) == 0 {
-		r.mtx.RUnlock()
-		return nil, nil
-	}
-
-	goroutineBudget := len(wanted) + len(r.uncheckedCollectors)
+	unchecked := make([]Collector, len(r.uncheckedCollectors))
+	copy(unchecked, r.uncheckedCollectors)
 	metricFamiliesByName := make(map[string]*dto.MetricFamily, len(r.dimHashesByName))
-	checkedCollectors := make(chan Collector, len(wanted))
-	uncheckedCollectors := make(chan Collector, len(r.uncheckedCollectors))
-	for _, collector := range wanted {
-		checkedCollectors <- collector
-	}
-	for _, collector := range r.uncheckedCollectors {
-		uncheckedCollectors <- collector
-	}
 	// In case pedantic checks are enabled, we have to copy the map before
 	// giving up the RLock.
 	if r.pedanticChecksEnabled {
@@ -528,6 +520,34 @@ func (r *Registry) gather(keep func(fqName string) bool) ([]*dto.MetricFamily, e
 		}
 	}
 	r.mtx.RUnlock()
+
+	// Decide which checked collectors are worth walking before walking any of
+	// them. This is the whole point of GatherFiltered: Collect on a Vec with a
+	// million children costs a million dto allocations, and no filter applied
+	// to the result can give that back. Filtering in place is safe here, the
+	// slice is ours.
+	if keep != nil {
+		kept := checked[:0]
+		for i, collector := range checked {
+			if keepsAnyName(checkedNames[i], keep) {
+				kept = append(kept, collector)
+			}
+		}
+		checked = kept
+		if len(checked) == 0 && len(unchecked) == 0 {
+			return nil, nil
+		}
+	}
+
+	goroutineBudget := len(checked) + len(unchecked)
+	checkedCollectors := make(chan Collector, len(checked))
+	uncheckedCollectors := make(chan Collector, len(unchecked))
+	for _, collector := range checked {
+		checkedCollectors <- collector
+	}
+	for _, collector := range unchecked {
+		uncheckedCollectors <- collector
+	}
 
 	wg.Add(goroutineBudget)
 
@@ -1230,7 +1250,9 @@ func GatherFiltered(g Gatherer, keep func(fqName string) bool) ([]*dto.MetricFam
 	if err != nil && mfs == nil {
 		return nil, err
 	}
-	out := mfs[:0]
+	// Do not filter in place: mfs belongs to g, which is free to hand back a
+	// slice it keeps.
+	var out []*dto.MetricFamily
 	for _, mf := range mfs {
 		if keep(mf.GetName()) {
 			out = append(out, mf)

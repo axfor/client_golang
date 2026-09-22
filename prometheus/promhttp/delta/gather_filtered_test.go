@@ -175,3 +175,89 @@ func TestGatherFilteredHelperWorksForAnyGatherer(t *testing.T) {
 		t.Fatal("plainGatherer should not implement FilteredGatherer")
 	}
 }
+
+// keep is caller-supplied code. The registry's read lock is released with an
+// explicit RUnlock, not a defer, so calling keep while holding it would leave
+// the registry locked for the life of the process the first time keep panicked
+// or reached back into the registry.
+func TestGatherFilteredDoesNotHoldTheLockWhileCallingKeep(t *testing.T) {
+	reg := buildMixed(50)
+
+	func() {
+		defer func() { recover() }()
+		_, _ = reg.GatherFiltered(func(string) bool { panic("boom") })
+	}()
+
+	// A registry left read-locked would hang both of these forever.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := reg.Register(prometheus.NewGauge(prometheus.GaugeOpts{Name: "after_panic"})); err != nil {
+			t.Error(err)
+		}
+		if _, err := reg.Gather(); err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("registry is stuck after keep panicked: the read lock was never released")
+	}
+}
+
+func TestGatherFilteredAllowsKeepToReadTheRegistry(t *testing.T) {
+	reg := buildMixed(50)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// A keep that gathers is pathological, but it must not deadlock.
+		_, err := reg.GatherFiltered(func(name string) bool {
+			if name == "model_router_f0" {
+				_, _ = reg.GatherFiltered(func(string) bool { return false })
+			}
+			return framework(name)
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("keep reaching back into the registry deadlocked")
+	}
+}
+
+// cachingGatherer hands back the same slice every time, which filtering in
+// place would corrupt.
+type cachingGatherer struct{ mfs []*dto.MetricFamily }
+
+func (c *cachingGatherer) Gather() ([]*dto.MetricFamily, error) { return c.mfs, nil }
+
+func TestGatherFilteredHelperDoesNotMutateTheSource(t *testing.T) {
+	reg := buildMixed(10)
+	all, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &cachingGatherer{mfs: all}
+	before := len(src.mfs)
+	names := make([]string, len(src.mfs))
+	for i, mf := range src.mfs {
+		names[i] = mf.GetName()
+	}
+
+	if _, err := prometheus.GatherFiltered(src, framework); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(src.mfs) != before {
+		t.Fatalf("source slice length changed: %d -> %d", before, len(src.mfs))
+	}
+	for i, mf := range src.mfs {
+		if mf.GetName() != names[i] {
+			t.Fatalf("source slice reordered at %d: %q -> %q", i, names[i], mf.GetName())
+		}
+	}
+}
