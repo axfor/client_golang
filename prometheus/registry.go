@@ -1202,3 +1202,39 @@ func keepsAnyName(names []string, keep func(string) bool) bool {
 	}
 	return false
 }
+
+// FilteredGatherer is a Gatherer that can restrict what it gathers by metric
+// name, without first gathering everything. *Registry implements it.
+type FilteredGatherer interface {
+	Gatherer
+	GatherFiltered(keep func(fqName string) bool) ([]*dto.MetricFamily, error)
+}
+
+// GatherFiltered gathers from g the metric families whose name keep returns
+// true for.
+//
+// It is the safe way to ask for a subset: where g can filter before collecting
+// -- a *Registry can -- that is what happens, and the cost is proportional to
+// what is kept. Otherwise it falls back to gathering everything and dropping
+// the rest, which is what the caller would have written anyway.
+//
+// A nil keep gathers everything.
+func GatherFiltered(g Gatherer, keep func(fqName string) bool) ([]*dto.MetricFamily, error) {
+	if keep == nil {
+		return g.Gather()
+	}
+	if fg, ok := g.(FilteredGatherer); ok {
+		return fg.GatherFiltered(keep)
+	}
+	mfs, err := g.Gather()
+	if err != nil && mfs == nil {
+		return nil, err
+	}
+	out := mfs[:0]
+	for _, mf := range mfs {
+		if keep(mf.GetName()) {
+			out = append(out, mf)
+		}
+	}
+	return out, err
+}

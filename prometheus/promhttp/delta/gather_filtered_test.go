@@ -142,3 +142,36 @@ func TestGatherFilteredCost(t *testing.T) {
 		t.Logf("GatherFiltered():         %v  → 留下 %d 条", time.Since(t0).Round(time.Microsecond), n)
 	}
 }
+
+// plainGatherer cannot filter before collecting, so the package-level helper
+// has to fall back to filtering the result.
+type plainGatherer struct{ g prometheus.Gatherer }
+
+func (p plainGatherer) Gather() ([]*dto.MetricFamily, error) { return p.g.Gather() }
+
+func TestGatherFilteredHelperWorksForAnyGatherer(t *testing.T) {
+	reg := buildMixed(100)
+
+	fast, err := prometheus.GatherFiltered(reg, framework)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow, err := prometheus.GatherFiltered(plainGatherer{reg}, framework)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fast) != len(slow) || len(fast) != 8 {
+		t.Fatalf("fast %d families, slow %d, want 8 each", len(fast), len(slow))
+	}
+	for i := range fast {
+		if fast[i].GetName() != slow[i].GetName() {
+			t.Fatalf("family %d: %q vs %q", i, fast[i].GetName(), slow[i].GetName())
+		}
+	}
+	if _, ok := prometheus.Gatherer(reg).(prometheus.FilteredGatherer); !ok {
+		t.Fatal("*Registry should implement FilteredGatherer")
+	}
+	if _, ok := prometheus.Gatherer(plainGatherer{reg}).(prometheus.FilteredGatherer); ok {
+		t.Fatal("plainGatherer should not implement FilteredGatherer")
+	}
+}
