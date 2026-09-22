@@ -67,6 +67,7 @@ func init() {
 func NewRegistry() *Registry {
 	return &Registry{
 		collectorsByID:  map[uint64]Collector{},
+		namesByCollectorID: map[uint64][]string{},
 		descIDs:         map[uint64]struct{}{},
 		dimHashesByName: map[string]uint64{},
 	}
@@ -273,6 +274,7 @@ func (errs MultiError) MaybeUnwrap() error {
 type Registry struct {
 	mtx                   sync.RWMutex
 	collectorsByID        map[uint64]Collector // ID is a hash of the descIDs.
+	namesByCollectorID    map[uint64][]string  // fqNames each collector reports, for GatherFiltered.
 	descIDs               map[uint64]struct{}
 	dimHashesByName       map[string]uint64
 	uncheckedCollectors   []Collector
@@ -285,6 +287,7 @@ func (r *Registry) Register(c Collector) error {
 		descChan           = make(chan *Desc, capDescChan)
 		newDescIDs         = map[uint64]struct{}{}
 		newDimHashesByName = map[string]uint64{}
+		newNames           = map[string]struct{}{}
 		collectorID        uint64 // All desc IDs XOR'd together.
 		duplicateDescErr   error
 	)
@@ -306,6 +309,11 @@ func (r *Registry) Register(c Collector) error {
 		if desc.err != nil {
 			return fmt.Errorf("descriptor %s is invalid: %w", desc, desc.err)
 		}
+
+		// Remember every name this collector reports, whatever the checks
+		// below decide. GatherFiltered needs the complete set to tell whether
+		// a collector can be skipped without collecting it.
+		newNames[desc.fqName] = struct{}{}
 
 		// Is the descID unique?
 		// (In other words: Is the fqName + constLabel combination unique?)
@@ -366,6 +374,14 @@ func (r *Registry) Register(c Collector) error {
 
 	// Only after all tests have passed, actually register.
 	r.collectorsByID[collectorID] = c
+	if r.namesByCollectorID == nil {
+		r.namesByCollectorID = map[uint64][]string{}
+	}
+	names := make([]string, 0, len(newNames))
+	for name := range newNames {
+		names = append(names, name)
+	}
+	r.namesByCollectorID[collectorID] = names
 	for hash := range newDescIDs {
 		r.descIDs[hash] = struct{}{}
 	}
@@ -404,6 +420,7 @@ func (r *Registry) Unregister(c Collector) bool {
 	defer r.mtx.Unlock()
 
 	delete(r.collectorsByID, collectorID)
+	delete(r.namesByCollectorID, collectorID)
 	for id := range descIDs {
 		delete(r.descIDs, id)
 	}
@@ -433,6 +450,32 @@ func (r *Registry) MustGather() []*dto.MetricFamily {
 
 // Gather implements Gatherer.
 func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
+	return r.gather(nil)
+}
+
+// GatherFiltered is Gather restricted to metric families whose name keep
+// returns true for.
+//
+// It differs from gathering everything and dropping what is not wanted -- which
+// is what promhttp's name[] parameter does, and what a filtering Gatherer
+// wrapper usually does -- in where the filtering happens. Those filter the
+// result, so a registry holding millions of instances pays for all of them to
+// produce a handful of lines. This one asks the filter before calling Collect,
+// so a collector none of whose names are kept is never walked at all.
+//
+// A collector that reported no Desc at registration (an unchecked collector)
+// has no names to test, so it is always collected and its metrics are filtered
+// afterwards.
+//
+// keep must not call back into the registry.
+func (r *Registry) GatherFiltered(keep func(fqName string) bool) ([]*dto.MetricFamily, error) {
+	if keep == nil {
+		return r.gather(nil)
+	}
+	return r.gather(keep)
+}
+
+func (r *Registry) gather(keep func(fqName string) bool) ([]*dto.MetricFamily, error) {
 	r.mtx.RLock()
 
 	if len(r.collectorsByID) == 0 && len(r.uncheckedCollectors) == 0 {
@@ -450,11 +493,27 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
 	)
 
-	goroutineBudget := len(r.collectorsByID) + len(r.uncheckedCollectors)
+	// Decide which checked collectors are worth walking before walking any of
+	// them. This is the whole point of GatherFiltered: Collect on a Vec with a
+	// million children costs a million dto allocations, and no filter applied
+	// to the result can give that back.
+	wanted := make([]Collector, 0, len(r.collectorsByID))
+	for id, collector := range r.collectorsByID {
+		if keep != nil && !keepsAnyName(r.namesByCollectorID[id], keep) {
+			continue
+		}
+		wanted = append(wanted, collector)
+	}
+	if len(wanted) == 0 && len(r.uncheckedCollectors) == 0 {
+		r.mtx.RUnlock()
+		return nil, nil
+	}
+
+	goroutineBudget := len(wanted) + len(r.uncheckedCollectors)
 	metricFamiliesByName := make(map[string]*dto.MetricFamily, len(r.dimHashesByName))
-	checkedCollectors := make(chan Collector, len(r.collectorsByID))
+	checkedCollectors := make(chan Collector, len(wanted))
 	uncheckedCollectors := make(chan Collector, len(r.uncheckedCollectors))
-	for _, collector := range r.collectorsByID {
+	for _, collector := range wanted {
 		checkedCollectors <- collector
 	}
 	for _, collector := range r.uncheckedCollectors {
@@ -522,6 +581,9 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				cmc = nil
 				break
 			}
+			if keep != nil && !keep(metric.Desc().fqName) {
+				break
+			}
 			safeErrs.Append(processMetric(
 				metric, metricFamiliesByName,
 				metricHashes,
@@ -530,6 +592,9 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 		case metric, ok := <-umc:
 			if !ok {
 				umc = nil
+				break
+			}
+			if keep != nil && !keep(metric.Desc().fqName) {
 				break
 			}
 			safeErrs.Append(processMetric(
@@ -549,6 +614,9 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 						cmc = nil
 						break
 					}
+					if keep != nil && !keep(metric.Desc().fqName) {
+						break
+					}
 					safeErrs.Append(processMetric(
 						metric, metricFamiliesByName,
 						metricHashes,
@@ -557,6 +625,9 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 				case metric, ok := <-umc:
 					if !ok {
 						umc = nil
+						break
+					}
+					if keep != nil && !keep(metric.Desc().fqName) {
 						break
 					}
 					safeErrs.Append(processMetric(
@@ -1120,4 +1191,14 @@ type noTransactionGatherer struct {
 func (g *noTransactionGatherer) Gather() (_ []*dto.MetricFamily, done func(), err error) {
 	mfs, err := g.g.Gather()
 	return mfs, func() {}, err
+}
+
+// keepsAnyName reports whether keep wants at least one of these names.
+func keepsAnyName(names []string, keep func(string) bool) bool {
+	for _, name := range names {
+		if keep(name) {
+			return true
+		}
+	}
+	return false
 }
