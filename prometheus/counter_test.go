@@ -385,3 +385,33 @@ func expectCTsForMetricVecValues(t testing.TB, vec *MetricVec, typ dto.MetricTyp
 		}
 	}
 }
+
+// A counter keeps its creation time as an integer and puts it on the dto only
+// when written. A dto one counter was written into and another is then written
+// into -- as a caller reusing one dto per family does -- must carry the second
+// one's time, set in place on the timestamp already there rather than on a new
+// one allocated for every write.
+func TestCounterCreatedTimestampIsSetInPlace(t *testing.T) {
+	t1 := time.Unix(1700000000, 123456789)
+	t2 := time.Unix(1700000500, 987654321)
+	c1 := NewCounter(CounterOpts{Name: "a", Help: "a", now: func() time.Time { return t1 }})
+	c2 := NewCounter(CounterOpts{Name: "b", Help: "b", now: func() time.Time { return t2 }})
+
+	var m dto.Metric
+	if err := c1.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	first := m.Counter.CreatedTimestamp
+	if got := first.AsTime(); !got.Equal(t1) {
+		t.Fatalf("first write: created %v, want %v", got, t1)
+	}
+	if err := c2.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Counter.CreatedTimestamp.AsTime(); !got.Equal(t2) {
+		t.Fatalf("second write into the same dto: created %v, want %v", got, t2)
+	}
+	if m.Counter.CreatedTimestamp != first {
+		t.Error("a new timestamp was allocated; the one already on the dto should have been set")
+	}
+}

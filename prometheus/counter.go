@@ -97,7 +97,7 @@ func NewCounter(opts CounterOpts) Counter {
 	}
 	result := &counter{desc: desc, labelPairs: desc.constLabelPairs, now: opts.now}
 	result.init(result) // Init self-collection.
-	result.createdTs = timestamppb.New(opts.now())
+	result.created = opts.now().UnixNano()
 	return result
 }
 
@@ -117,7 +117,11 @@ type counter struct {
 	selfCollector
 	desc *Desc
 
-	createdTs  *timestamppb.Timestamp
+	// created is the creation time in Unix nanoseconds. It used to be kept as
+	// a *timestamppb.Timestamp, one per counter for the life of the process: at
+	// 1.6M instances that was 70 MiB, 5% of a sidecar's heap, for a value that is
+	// only read when the counter is written out. See createdTimestamp.
+	created    int64
 	labelPairs []*dto.LabelPair
 	exemplar   atomic.Value // Containing nil or a *dto.Exemplar.
 
@@ -177,7 +181,21 @@ func (c *counter) Write(out *dto.Metric) error {
 		exemplar = e.(*dto.Exemplar)
 	}
 	val := c.get()
-	return populateMetric(CounterValue, val, c.labelPairs, exemplar, out, c.createdTs)
+	return populateMetric(CounterValue, val, c.labelPairs, exemplar, out, c.createdTimestamp(out))
+}
+
+// createdTimestamp returns the creation time as out is to carry it. A dto a
+// previous Write filled in already has a timestamp, which is set in place, so a
+// caller writing into the same dto every scrape allocates nothing; a fresh dto,
+// as Gather passes, gets a new one.
+func (c *counter) createdTimestamp(out *dto.Metric) *timestamppb.Timestamp {
+	sec, nsec := c.created/1e9, int32(c.created%1e9)
+	if oc := out.Counter; oc != nil && oc.CreatedTimestamp != nil {
+		ts := oc.CreatedTimestamp
+		ts.Seconds, ts.Nanos = sec, nsec
+		return ts
+	}
+	return &timestamppb.Timestamp{Seconds: sec, Nanos: nsec}
 }
 
 func (c *counter) updateExemplar(v float64, l Labels) {
@@ -228,7 +246,7 @@ func (v2) NewCounterVec(opts CounterVecOpts) *CounterVec {
 			}
 			result := &counter{desc: desc, labelPairs: MakeLabelPairs(desc, lvs), now: opts.now}
 			result.init(result) // Init self-collection.
-			result.createdTs = timestamppb.New(opts.now())
+			result.created = opts.now().UnixNano()
 			return result
 		}),
 	}
