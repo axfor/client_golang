@@ -66,10 +66,10 @@ func init() {
 // pre-registered.
 func NewRegistry() *Registry {
 	return &Registry{
-		collectorsByID:  map[uint64]Collector{},
+		collectorsByID:     map[uint64]Collector{},
 		namesByCollectorID: map[uint64][]string{},
-		descIDs:         map[uint64]struct{}{},
-		dimHashesByName: map[string]uint64{},
+		descIDs:            map[uint64]struct{}{},
+		dimHashesByName:    map[string]uint64{},
 	}
 }
 
