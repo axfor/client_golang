@@ -35,12 +35,9 @@ func internPtr(e *TrackedExposer) uintptr {
 func exposerCapacity(e *TrackedExposer) int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	total := cap(e.taken) + cap(e.lent)
-	for _, r := range e.rows {
-		total += cap(r)
-	}
-	for _, l := range e.free {
-		total += cap(l)
+	total := cap(e.taken) + cap(e.fam.rows) + cap(e.fam.nums)
+	for _, s := range e.slots {
+		total += cap(s.picks)
 	}
 	return total
 }

@@ -393,10 +393,13 @@ func TestOutageLongerThanIdleScrapes(t *testing.T) {
 	}
 }
 
-// A dto is needed only for the instances written in one scrape. Keeping one per
-// instance was 19% of the heap of a sidecar holding 30k keys of which a small
-// share is active, so they are lent out per scrape and taken back.
-func TestDTOsAreLentPerScrapeNotPerInstance(t *testing.T) {
+// A dto is needed only while an instance is being written: every instance goes
+// through the one scratch, and a family's values are kept only while that family
+// is being encoded. Keeping a dto per instance written was a quarter of the heap
+// of a sidecar at 1.6M instances, first per instance and then on free lists
+// sized to the most a scrape ever wrote, so nothing sized by that may outlive
+// the scrape beyond arrays that fall back.
+func TestNoDTOIsKeptBetweenScrapes(t *testing.T) {
 	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true})
 	const keys = 200
 	for i := range keys {
@@ -404,43 +407,39 @@ func TestDTOsAreLentPerScrapeNotPerInstance(t *testing.T) {
 	}
 	f.scrape(t, false) // every counter is new, so every one is written
 
-	pooled := func() int {
-		n := 0
-		for _, l := range f.exp.free {
-			n += len(l)
+	held := func() (rows, nums int) {
+		f.exp.mu.Lock()
+		defer f.exp.mu.Unlock()
+		if len(f.exp.fam.rows) != 0 || len(f.exp.fam.nums) != 0 || f.exp.fam.mf != nil {
+			t.Fatalf("a family is still held after the scrape: %d rows, %d values", len(f.exp.fam.rows), len(f.exp.fam.nums))
 		}
-		return n
+		return cap(f.exp.fam.rows), cap(f.exp.fam.nums)
 	}
-	if got := pooled(); got < keys {
-		t.Fatalf("after a scrape that wrote %d instances the pool holds %d; they should have come back", keys, got)
-	}
-	if len(f.exp.lent) != 0 {
-		t.Errorf("%d dtos are still on loan after the scrape", len(f.exp.lent))
+	beforeRows, beforeNums := held()
+	if beforeRows < keys {
+		t.Fatalf("the family arrays hold room for %d rows after a scrape that wrote %d; expected the room to be kept for now", beforeRows, keys)
 	}
 
-	// From here on only two counters move. The pool has to fall back towards
-	// that: the first scrape after start-up writes every instance, and a pool
-	// left at that mark would hold a dto per instance for the rest of the
-	// process, which is what lending them is meant to avoid.
-	before := pooled()
+	// From here on only two counters move. The room has to fall back towards
+	// that: the first scrape after start-up writes every instance, and arrays
+	// left at that size would be the per-instance cost this is meant to avoid.
 	for range 40 {
 		f.c.WithLabelValues("0").Inc()
 		f.c.WithLabelValues("1").Inc()
 		f.scrape(t, false)
 	}
-	after := pooled()
-	if after >= before {
-		t.Errorf("the pool stayed at %d after %d quiet scrapes; it should fall back from %d", after, 40, before)
-	}
-	if after > keys/10 {
-		t.Errorf("after 40 scrapes writing two instances the pool still holds %d of the %d it peaked at", after, before)
+	afterRows, afterNums := held()
+	// Down to the floor below which arrays are not worth shrinking.
+	if afterRows > minShrink || afterNums > minShrink {
+		t.Errorf("after 40 scrapes writing two instances the family arrays still hold room for %d rows and %d values, down from %d and %d",
+			afterRows, afterNums, beforeRows, beforeNums)
 	}
 
-	// And the values still come out right through a recycled dto.
+	// And the values still come out right through the shared scratch.
 	f.c.WithLabelValues("7").Add(3)
 	m, _ := f.scrape(t, false)
 	if m[`c_total{key=7}`] != 3 {
-		t.Errorf("a recycled dto reported the wrong increment: %v", m[`c_total{key=7}`])
+		t.Errorf("the wrong increment came out: %v", m[`c_total{key=7}`])
 	}
 }
 
@@ -742,13 +741,20 @@ func TestScrapeScratchHoldsNothingAfterTheScrape(t *testing.T) {
 
 	f.exp.mu.Lock()
 	defer f.exp.mu.Unlock()
-	for i, r := range f.exp.rows {
-		full := r[:cap(r)]
-		for j := len(r); j < len(full); j++ {
-			if full[j] != nil {
-				t.Fatalf("rows[%d] still points at an entry at index %d, past its length %d (cap %d)",
-					i, j, len(r), cap(r))
+	for i, s := range f.exp.slots {
+		full := s.picks[:cap(s.picks)]
+		for j := len(s.picks); j < len(full); j++ {
+			if full[j].m != nil || full[j].en != nil {
+				t.Fatalf("slots[%d] still points at an instance at index %d, past its length %d (cap %d)",
+					i, j, len(s.picks), cap(s.picks))
 			}
+		}
+	}
+	rows := f.exp.fam.rows[:cap(f.exp.fam.rows)]
+	for j := len(f.exp.fam.rows); j < len(rows); j++ {
+		if rows[j].en != nil || rows[j].labels != nil {
+			t.Fatalf("the family rows still point at an entry at index %d, past their length %d (cap %d)",
+				j, len(f.exp.fam.rows), cap(f.exp.fam.rows))
 		}
 	}
 	full := f.exp.taken[:cap(f.exp.taken)]

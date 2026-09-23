@@ -19,7 +19,6 @@ import (
 	"strconv"
 
 	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 )
 
@@ -103,35 +102,6 @@ func (es *encState) resetIntern() {
 	clear(es.intern)
 }
 
-// encodeFamilies writes the families of one scrape. rows[i] holds the entries
-// behind buf[i].Metric, in the same order, and carries the cached labels.
-func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, buf []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, es *encState, genLabel, typeLabel string) error {
-	defer es.resetIntern()
-	for i, mf := range buf {
-		if len(mf.Metric) == 0 {
-			continue
-		}
-		sh := cacheLabels(mf, rows[i], gen, es, genLabel, typeLabel)
-		if sh == nil {
-			// expfmt renders from the dto, so the generation has to go on it here.
-			// It cannot be decided earlier: whether this encoder takes a family is
-			// only known once every metric of it is in.
-			stampFallback(mf, rows[i], gen, genLabel, typeLabel)
-			if err := enc.Encode(mf); err != nil {
-				return err
-			}
-			continue
-		}
-		writeFamilyHeader(w, mf)
-		for j, m := range mf.Metric {
-			if err := writeCached(w, sh, m, rows[i][j], es); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // familyShape is what every series of a family writes the same way: the metric
 // name with each suffix, and the le fragment of each bucket. It is built once
 // per family per bucket layout rather than once per series.
@@ -213,73 +183,6 @@ func leFragment(v float64) []byte {
 	return append(b, '"', '}', ' ')
 }
 
-// cacheLabels makes sure every entry of a family has its rendered labels, and
-// returns the shape the family writes with, or nil when expfmt has to take over.
-func cacheLabels(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, es *encState, genLabel, typeLabel string) *familyShape {
-	if len(rows) != len(mf.Metric) || !handled(mf) {
-		return nil
-	}
-	if !model.LegacyValidation.IsValidMetricName(mf.GetName()) {
-		return nil
-	}
-	// A gauge never carries the generation: it is a current value, not something
-	// that accumulates across a rebuild.
-	switch mf.GetType() {
-	case dto.MetricType_COUNTER, dto.MetricType_HISTOGRAM:
-	default:
-		genLabel = ""
-	}
-	// The type is the family's, so the label that carries it is built once here
-	// rather than per series.
-	extra := es.extra[:0]
-	if typeLabel != "" {
-		extra = append(extra, extraLabel{typeLabel, typeName(mf.GetType())})
-	}
-	genAt := -1
-	if genLabel != "" {
-		genAt = len(extra)
-		extra = append(extra, extraLabel{genLabel, ""})
-	}
-	sortExtra(extra)
-	if genAt >= 0 {
-		for i := range extra {
-			if extra[i].name == genLabel {
-				genAt = i
-			}
-		}
-	}
-
-	var sh *familyShape
-	for j, m := range mf.Metric {
-		en := rows[j]
-		if en == nil || m.TimestampMs != nil {
-			return nil
-		}
-		if sh == nil {
-			sh = shapeOf(mf, m, es.shapes)
-		} else if !sh.fits(m) {
-			// The shape carries the le fragments of the family's bucket layout.
-			// A metric with a different layout would be written against the wrong
-			// bounds, so the family goes to expfmt instead.
-			return nil
-		}
-		g := gen(en)
-		if en.rendered != "" && en.renderedGen == g {
-			continue
-		}
-		if genAt >= 0 {
-			extra[genAt].value = strconv.FormatInt(g, 10)
-		}
-		rendered, ok := buildLabels(es.buf[:0], m, extra)
-		if !ok {
-			return nil
-		}
-		es.buf = rendered // keep the grown scratch
-		en.rendered, en.renderedGen = es.share(rendered), g
-	}
-	return sh
-}
-
 // stampFallback puts the generation label on a family expfmt is about to render.
 // Gauges never carry it, and neither does a family with no entries behind it.
 func stampFallback(mf *dto.MetricFamily, rows []*entry, gen func(*entry) int64, genLabel, typeLabel string) {
@@ -333,22 +236,6 @@ func withLabel(labels []*dto.LabelPair, lp *dto.LabelPair, at int, replace bool)
 		at++
 	}
 	return append(out, labels[at:]...)
-}
-
-func handled(mf *dto.MetricFamily) bool {
-	switch mf.GetType() {
-	case dto.MetricType_COUNTER, dto.MetricType_GAUGE, dto.MetricType_UNTYPED:
-		return true
-	case dto.MetricType_HISTOGRAM:
-		for _, m := range mf.Metric {
-			if m.Histogram == nil || isNative(m.Histogram) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
 }
 
 func bucketsOf(m *dto.Metric) []*dto.Bucket {
@@ -450,70 +337,6 @@ func appendGen(dst []byte, sep byte, genLabel string, gen int64) []byte {
 	dst = append(dst, '=', '"')
 	dst = strconv.AppendInt(dst, gen, 10)
 	return append(dst, '"')
-}
-
-// writeCached writes one metric from its cached labels and its family's shape.
-//
-// A series with no labels needs the braces opened by the le fragment instead of
-// by the labels, which is the only place the two cases differ.
-func writeCached(w *bufio.Writer, sh *familyShape, m *dto.Metric, en *entry, es *encState) error {
-	plain := closeBrace
-	if len(en.rendered) == 0 {
-		plain = plain[1:] // no labels, so no braces to close
-	}
-	line := func(name, tail []byte, v float64) error {
-		if _, err := w.Write(name); err != nil {
-			return err
-		}
-		if _, err := w.WriteString(en.rendered); err != nil {
-			return err
-		}
-		if len(en.rendered) == 0 && len(tail) > 0 && tail[0] == ',' {
-			if err := w.WriteByte('{'); err != nil {
-				return err
-			}
-			tail = tail[1:]
-		}
-		if _, err := w.Write(tail); err != nil {
-			return err
-		}
-		es.num = appendFloat(es.num[:0], v) // kept, or the buffer is reallocated every value
-		if _, err := w.Write(es.num); err != nil {
-			return err
-		}
-		return w.WriteByte('\n')
-	}
-	switch sh.typ {
-	case dto.MetricType_COUNTER:
-		return line(sh.name, plain, m.GetCounter().GetValue())
-	case dto.MetricType_GAUGE:
-		return line(sh.name, plain, m.GetGauge().GetValue())
-	case dto.MetricType_UNTYPED:
-		return line(sh.name, plain, m.GetUntyped().GetValue())
-	}
-	h := m.GetHistogram()
-	count := h.GetSampleCountFloat()
-	if count == 0 {
-		count = float64(h.GetSampleCount())
-	}
-	for i, b := range h.Bucket {
-		v := b.GetCumulativeCountFloat()
-		if v == 0 {
-			v = float64(b.GetCumulativeCount())
-		}
-		if err := line(sh.bucket, sh.les[i], v); err != nil {
-			return err
-		}
-	}
-	if !sh.infLast {
-		if err := line(sh.bucket, sh.les[len(sh.les)-1], count); err != nil {
-			return err
-		}
-	}
-	if err := line(sh.sum, plain, h.GetSampleSum()); err != nil {
-		return err
-	}
-	return line(sh.count, plain, count)
 }
 
 var closeBrace = []byte("} ")

@@ -50,32 +50,32 @@ type TrackedExposer struct {
 	tracker *prometheus.ChangeTracker
 	rb      rebaseState
 
-	mu      sync.Mutex
-	round   uint64
-	state   map[prometheus.Metric]*entry
-	scratch dto.Metric
-	buf     []*dto.MetricFamily
-	rows    [][]*entry // rows[i] are the entries behind buf[i].Metric, in order
+	mu    sync.Mutex
+	round uint64
+	state map[prometheus.Metric]*entry
+	// scratch is the dto each family's instances are written into, one after
+	// another, see tracked_emit.go. One per family rather than one for all, so
+	// that Write finds the family's shape already there and updates it in place
+	// instead of allocating a counter, or a histogram and all its buckets, for
+	// every instance of every scrape.
+	scratch map[string]*dto.Metric
 	taken   []prometheus.Metric
 	gauges  []prometheus.Metric // every gauge seen, walked in full every scrape
 
-	// A dto is only needed for the instances written in one scrape, which at a
-	// realistic active share is a small part of what is registered. They are
-	// lent out per scrape instead of kept per instance, from a free list per
-	// family so that the one handed out already has the family's bucket layout
-	// and Write updates it in place.
-	free   map[string][]*dto.Metric
-	lent   []loan
-	peak   map[string]int // recent high-water mark of borrows, so the free list can fall back
-	byName map[string]int // family name to its index in buf
+	// The instances taken this scrape, by family, in the order the families
+	// were first seen; slots past nslots are left over from earlier scrapes.
+	slots  []familySlot
+	nslots int
+	byName map[string]int // family name to its index in slots
+	fam    familyRows     // the family being written
 	enc    *encState
 
 	// Recent high-water marks, so the arrays behind these can be given back
 	// after idle cleanup instead of staying at the size they once needed.
 	statePeak int
 	takenPeak int
-	lentPeak  int
-	rowPeak   []int
+	rowsPeak  int
+	numsPeak  int
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -90,8 +90,7 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 		opts:    opts,
 		tracker: t,
 		state:   map[prometheus.Metric]*entry{},
-		free:    map[string][]*dto.Metric{},
-		peak:    map[string]int{},
+		scratch: map[string]*dto.Metric{},
 		byName:  map[string]int{},
 		enc:     newEncState(),
 	}
@@ -150,41 +149,15 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	st.Round = e.round
 	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
 
-	// Clear to the capacity, not just the length. Truncating alone leaves the
-	// pointers in the backing array, and the first scrape after start-up sizes
-	// that array to every instance the process has: idle cleanup then drops an
-	// entry from state and from its Vec while these keep it -- and its labels,
-	// its dto and the instance itself -- alive for the life of the process.
-	for i := range e.rows {
-		r := e.rows[i]
-		clear(r[:cap(r)])
-		if i < len(e.rowPeak) {
-			decay(&e.rowPeak[i], len(r))
-			r = fallBack(r, e.rowPeak[i])
-		}
-		e.rows[i] = r[:0]
-	}
-	// Same as e.rows: a stale *dto.MetricFamily past the length keeps its whole
-	// Metric slice, and those dtos stay alive after the free list has trimmed
-	// them.
-	clear(e.buf[:cap(e.buf)])
-	e.buf = e.buf[:0]
 	clear(e.byName)
-	var pending []pendingCommit
+	e.nslots = 0
+	e.taken = e.taken[:0]
 	var idle []*entry
-	taken := e.taken[:0] // taken this scrape; put back on the dirty list if undelivered
 
+	// First pass: take what is due, grouped by family, without writing any of it.
+	//
 	// everything written since the previous scrape
-	e.tracker.Take(func(m prometheus.Metric) {
-		pc, ok := e.take(m, false)
-		if !ok {
-			return
-		}
-		taken = append(taken, m)
-		if pc != nil {
-			pending = append(pending, *pc)
-		}
-	})
+	e.tracker.Take(func(m prometheus.Metric) { e.pick(m, pickChanged) })
 
 	// the bucket due this scrape: top up unchanged series, list idle ones to drop
 	if !e.opts.DisableHeartbeat || e.opts.IdleScrapes > 0 {
@@ -201,13 +174,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 				return
 			}
 			if !e.opts.DisableHeartbeat && en.lastRound != e.round {
-				if pc, ok := e.take(m, true); ok {
-					st.Heartbeat++
-					taken = append(taken, m)
-					if pc != nil {
-						pending = append(pending, *pc)
-					}
-				}
+				e.pick(m, pickHeartbeat)
 			}
 		})
 	}
@@ -225,25 +192,19 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 			continue
 		}
 		if en.lastRound != e.round {
-			if pc, ok := e.take(m, true); ok {
-				st.Gauges++
-				taken = append(taken, m)
-				if pc != nil {
-					pending = append(pending, *pc)
-				}
-			}
+			e.pick(m, pickGauge)
 		}
 		i++
 	}
 
-	for _, mf := range e.buf {
-		st.Samples += len(mf.Metric)
-	}
-	st.Families = len(e.buf)
-
+	// Second pass: write, decide and encode one family at a time.
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
-	st.Err = encodeFamilies(rs.w, enc, e.buf, e.rows, e.rb.genOf, e.enc, e.opts.GenLabel, e.opts.TypeLabel)
+	var pending []pendingCommit
+	for i := 0; i < e.nslots && st.Err == nil; i++ {
+		st.Err = e.emitFamily(&e.slots[i], rs.w, enc, &st, &pending)
+	}
+	e.enc.resetIntern()
 	st.Err, st.Delivered = rs.close(st.Err, r)
 
 	if st.Delivered {
@@ -252,168 +213,37 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	} else {
 		// undelivered: put them back so the next scrape reports them again,
 		// together with whatever accrues in the meantime
-		for _, m := range taken {
+		for _, m := range e.taken {
 			prometheus.MarkChanged(m)
 		}
 	}
-	e.returnAll()
 
-	clear(taken)
-	// Same as e.rows above: these are live instances, and holding them past the
-	// scrape keeps everything they reference.
-	clear(taken[:cap(taken)])
-	decay(&e.takenPeak, len(taken))
-	e.taken = fallBack(taken, e.takenPeak)[:0]
+	// Clear to the capacity, not just the length. Truncating alone leaves the
+	// pointers in the backing arrays, and the first scrape after start-up sizes
+	// them to every instance the process has: idle cleanup then drops an entry
+	// from state and from its Vec while these keep it -- and its labels and the
+	// instance itself -- alive for the life of the process.
+	for i := range e.slots {
+		s := &e.slots[i]
+		clear(s.picks[:cap(s.picks)])
+		decay(&s.peak, len(s.picks))
+		s.picks = fallBack(s.picks, s.peak)[:0]
+		if i >= e.nslots {
+			s.desc = nil
+		}
+	}
+	decay(&e.rowsPeak, e.fam.rowsHigh)
+	decay(&e.numsPeak, e.fam.numsHigh)
+	e.fam.rows = fallBack(e.fam.rows, e.rowsPeak)[:0]
+	e.fam.nums = fallBack(e.fam.nums, e.numsPeak)[:0]
+	e.fam.rowsHigh, e.fam.numsHigh = 0, 0
+	clear(e.taken[:cap(e.taken)])
+	decay(&e.takenPeak, len(e.taken))
+	e.taken = fallBack(e.taken, e.takenPeak)[:0]
 	st.Deleted = e.drop(idle)
 	return st
 }
 
-// take writes one instance into a dto, works out the value to report, and puts
-// it in this scrape's family.
-func (e *TrackedExposer) take(m prometheus.Metric, heartbeat bool) (*pendingCommit, bool) {
-	desc := m.Desc()
-	en := e.state[m]
-	fresh := en == nil
-	if fresh {
-		en = &entry{family: desc.Name(), changed: e.round, born: e.rb.clock().Unix()}
-		e.state[m] = en
-	}
-	en.lastRound = e.round
-
-	// Write into a dto borrowed for this scrape rather than a shared scratch: one
-	// a previous Write already filled in is updated in place, so a steady-state
-	// scrape allocates nothing here. An empty free list means there is nothing to
-	// update, so it goes through the scratch and keeps the copy.
-	name := desc.Name()
-	out := e.borrow(name)
-	if out == nil {
-		e.scratch.Reset()
-		if err := m.Write(&e.scratch); err != nil {
-			return nil, false
-		}
-		out = cloneMetric(&e.scratch)
-		e.lent = append(e.lent, loan{name, out})
-	} else if err := m.Write(out); err != nil {
-		return nil, false
-	}
-	if typ := metricType(out); typ == nil || !e.opts.Only.carries(*typ) {
-		return nil, true // not this endpoint's kind; nothing taken, nothing lost
-	}
-	mf, idx := e.family(desc, out, en)
-	if mf == nil {
-		return nil, false
-	}
-	en.kind = mf.GetType()
-	if fresh && en.kind == dto.MetricType_GAUGE {
-		// Gauges are reported in full every scrape, which the bucketed walk over
-		// the tracker cannot do, so they get a list of their own. Entries dropped
-		// as idle are pruned from it lazily in Serve.
-		e.gauges = append(e.gauges, m)
-	}
-	// Capture the labels before decide stamps the generation on them: they are
-	// handed to Options.Delete, which looks the child up in its Vec, and the Vec
-	// has no generation label. Only needed when there is a callback; without one
-	// idle cleanup goes through prometheus.DeleteTracked.
-	if en.labels == nil && e.opts.Delete != nil {
-		en.labels = labelsOf(out.Label)
-	}
-	emit, _, pc := e.decide(mf, out, en)
-	if !emit && !heartbeat {
-		// unchanged, e.g. added and subtracted again within one scrape: skip it,
-		// without affecting the next scrape
-		mf.Metric = mf.Metric[:len(mf.Metric)-1]
-		e.rows[idx] = e.rows[idx][:len(e.rows[idx])-1]
-		return pc, true
-	}
-	return pc, true
-}
-
-// family finds or creates the metric family this instance belongs to, adds it,
-// and returns the family together with its index, which the caller needs to
-// keep the parallel entry rows in step.
-func (e *TrackedExposer) family(desc *prometheus.Desc, m *dto.Metric, en *entry) (*dto.MetricFamily, int) {
-	name := desc.Name()
-	idx, ok := e.byName[name]
-	if !ok {
-		typ := metricType(m)
-		if typ == nil {
-			return nil, 0
-		}
-		help := desc.Help()
-		idx = len(e.buf)
-		e.buf = append(e.buf, &dto.MetricFamily{Name: &name, Help: &help, Type: typ})
-		if idx == len(e.rows) {
-			e.rows = append(e.rows, nil)
-			e.rowPeak = append(e.rowPeak, 0)
-		}
-		e.rows[idx] = e.rows[idx][:0]
-		e.byName[name] = idx
-	}
-	mf := e.buf[idx]
-	mf.Metric = append(mf.Metric, m)
-	e.rows[idx] = append(e.rows[idx], en)
-	return mf, idx
-}
-
-// loan is a dto handed out for one scrape, and the family to put it back under.
-type loan struct {
-	family string
-	m      *dto.Metric
-}
-
-// borrow takes a dto off the family's free list, or returns nil when it is
-// empty. What it hands out is recorded so that returnAll can take it back once
-// the response has been written.
-func (e *TrackedExposer) borrow(family string) *dto.Metric {
-	l := e.free[family]
-	if len(l) == 0 {
-		return nil
-	}
-	out := l[len(l)-1]
-	e.free[family] = l[:len(l)-1]
-	e.lent = append(e.lent, loan{family, out})
-	return out
-}
-
-// returnAll puts this scrape's dtos back, and lets the free lists fall back
-// towards what recent scrapes actually used. Without that they would stay at
-// their high-water mark, which is the first scrape after start-up: every
-// instance is new then, so every one is written, and the lists would keep a dto
-// per instance for the rest of the process -- the very thing lending them
-// avoids. The mark decays by an eighth a scrape, so a burst is given up over a
-// few minutes while a steady load never has to reallocate.
-func (e *TrackedExposer) returnAll() {
-	used := map[string]int{}
-	for i, l := range e.lent {
-		e.free[l.family] = append(e.free[l.family], l.m)
-		used[l.family]++
-		e.lent[i].m = nil
-	}
-	decay(&e.lentPeak, len(e.lent))
-	e.lent = fallBack(e.lent, e.lentPeak)[:0]
-	for family, l := range e.free {
-		mark := e.peak[family] - e.peak[family]/8
-		if used[family] > mark {
-			mark = used[family]
-		}
-		e.peak[family] = mark
-		if keep := mark + mark/4; len(l) > keep {
-			clear(l[keep:])
-			l = l[:keep]
-			// Truncating releases the dtos past keep but not the array holding
-			// them, which the first scrape after start-up sized to every
-			// instance in the process.
-			if f := fallBack(l, keep); cap(f) != cap(l) {
-				f = f[:len(l)]
-				copy(f, l)
-				l = f
-			}
-			e.free[family] = l
-		}
-	}
-}
-
-// decide reuses Exposer's change-only and delta logic.
 func (e *TrackedExposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, bool, *pendingCommit) {
 	shim := &Exposer{opts: e.opts, round: e.round, rb: e.rb, cached: true}
 	return shim.decide(mf, m, en)
@@ -499,34 +329,4 @@ func metricType(m *dto.Metric) *dto.MetricType {
 		return nil
 	}
 	return &t
-}
-
-// cloneMetric copies what is in scratch: scratch is reused for every instance,
-// while the output is only encoded once the whole scrape has been collected.
-func cloneMetric(src *dto.Metric) *dto.Metric {
-	out := &dto.Metric{Label: src.Label}
-	switch {
-	case src.Counter != nil:
-		v := src.Counter.GetValue()
-		out.Counter = &dto.Counter{Value: &v, Exemplar: src.Counter.Exemplar, CreatedTimestamp: src.Counter.CreatedTimestamp}
-	case src.Gauge != nil:
-		v := src.Gauge.GetValue()
-		out.Gauge = &dto.Gauge{Value: &v}
-	case src.Histogram != nil:
-		h := src.Histogram
-		sum, count := h.GetSampleSum(), h.GetSampleCount()
-		nh := &dto.Histogram{SampleSum: &sum, SampleCount: &count, CreatedTimestamp: h.CreatedTimestamp}
-		nh.Bucket = make([]*dto.Bucket, len(h.Bucket))
-		for i, b := range h.Bucket {
-			c, ub := b.GetCumulativeCount(), b.GetUpperBound()
-			nh.Bucket[i] = &dto.Bucket{CumulativeCount: &c, UpperBound: &ub, Exemplar: b.Exemplar}
-		}
-		out.Histogram = nh
-	case src.Summary != nil:
-		out.Summary = src.Summary
-	case src.Untyped != nil:
-		v := src.Untyped.GetValue()
-		out.Untyped = &dto.Untyped{Value: &v}
-	}
-	return out
 }
