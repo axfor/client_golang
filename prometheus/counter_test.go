@@ -280,7 +280,7 @@ func TestCounterExemplar(t *testing.T) {
 	}
 
 	counter.AddWithExemplar(42, Labels{"foo": "bar"})
-	if expected, got := expectedExemplar.String(), counter.exemplar.Load().(*dto.Exemplar).String(); expected != got {
+	if expected, got := expectedExemplar.String(), counter.exemplar.Load().String(); expected != got {
 		t.Errorf("expected exemplar %s, got %s.", expected, got)
 	}
 

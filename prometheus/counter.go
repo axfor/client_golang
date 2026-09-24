@@ -123,7 +123,10 @@ type counter struct {
 	// only read when the counter is written out. See createdTimestamp.
 	created    int64
 	labelPairs []*dto.LabelPair
-	exemplar   atomic.Value // Containing nil or a *dto.Exemplar.
+	// nil or the last exemplar. A typed pointer rather than an atomic.Value:
+	// 8 bytes instead of 16, which takes the counter from 104 bytes to 96, a
+	// size class down, on every child of every CounterVec.
+	exemplar atomic.Pointer[dto.Exemplar]
 
 	// now is for testing purposes, by default it's time.Now.
 	now func() time.Time
@@ -176,10 +179,7 @@ func (c *counter) get() float64 {
 func (c *counter) Write(out *dto.Metric) error {
 	// Read the Exemplar first and the value second. This is to avoid a race condition
 	// where users see an exemplar for a not-yet-existing observation.
-	var exemplar *dto.Exemplar
-	if e := c.exemplar.Load(); e != nil {
-		exemplar = e.(*dto.Exemplar)
-	}
+	exemplar := c.exemplar.Load()
 	val := c.get()
 	return populateMetric(CounterValue, val, c.labelPairs, exemplar, out, c.createdTimestamp(out))
 }
