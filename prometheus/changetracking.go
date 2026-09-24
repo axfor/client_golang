@@ -16,6 +16,7 @@ package prometheus
 import (
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // Change tracking, used by the change-only and delta exposition in
@@ -56,9 +57,10 @@ type dirtyState struct {
 	epoch atomic.Uint32 // shard epoch as of the last time this entered the dirty list
 	shard *dirtyShard
 	owner Metric
-	home  *metricMap // the Vec this instance belongs to, so it can be dropped
-	hash  uint64     // its bucket in home
-	idx   int        // index into the shard's all slice, for removal
+	home  *metricMap     // the Vec this instance belongs to, so it can be dropped
+	hash  uint64         // its bucket in home
+	idx   int            // index into the shard's all slice, for removal
+	slot  unsafe.Pointer // the consumer's, see TrackerSlot
 }
 
 // mark enlists d unless it is already waiting to be taken. An equal epoch means
@@ -241,6 +243,29 @@ func DeleteTracked(m Metric) bool {
 		return false
 	}
 	return d.home.deleteMetric(d.hash, m)
+}
+
+// TrackerSlot returns one word for the tracker's consumer to keep its own state
+// for m in, or nil when m is not tracked: not created through a Vec while a
+// tracker was set, or deleted from its Vec since.
+//
+// It saves the consumer a map from every instance to its state, which at a few
+// million instances is tens of megabytes of table on top of the state itself,
+// and it goes with the instance: a child deleted from its Vec by any means takes
+// the state with it instead of leaving it in the consumer's map. The word fits
+// in the size class dirtyState already occupied, so it costs nothing extra. It
+// starts nil and is read and written only by the single consumer the tracker
+// already assumes.
+func TrackerSlot(m Metric) *unsafe.Pointer {
+	ref, ok := dirtyRefOf(m)
+	if !ok {
+		return nil
+	}
+	d := ref.d
+	if d == nil {
+		return nil
+	}
+	return &d.slot
 }
 
 func dirtyRefOf(m Metric) (*dirtyRef, bool) {
