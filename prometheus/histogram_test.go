@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -455,7 +456,7 @@ func TestHistogramExemplar(t *testing.T) {
 	histogram.ObserveWithExemplar(4, Labels{"id": "3"})
 	histogram.ObserveWithExemplar(4.5, Labels{"id": "4"}) // Should go to +Inf bucket.
 
-	for i, ex := range histogram.exemplars {
+	for i, ex := range *histogram.exemplars.Load() {
 		var got, expected string
 		if val := ex.Load(); val != nil {
 			got = val.(*dto.Exemplar).String()
@@ -465,6 +466,46 @@ func TestHistogramExemplar(t *testing.T) {
 		}
 		if got != expected {
 			t.Errorf("expected exemplar %s, got %s.", expected, got)
+		}
+	}
+}
+
+// A histogram holds its exemplars in an array allocated by the first one, so a
+// histogram that never gets one -- most of them -- does not carry 16 bytes a
+// bucket for nothing. Observers racing to store the first exemplars must all
+// land in the same array: one that stored into an array that lost the race
+// would have its exemplar silently dropped.
+func TestHistogramExemplarsAllocatedOnFirstUse(t *testing.T) {
+	bounds := []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+	h := NewHistogram(HistogramOpts{Name: "lazy", Help: "lazy", Buckets: bounds}).(*histogram)
+	h.Observe(3)
+	if h.exemplars.Load() != nil {
+		t.Fatal("a histogram observed without exemplars allocated room for them")
+	}
+
+	for round := range 200 {
+		h := NewHistogram(HistogramOpts{Name: "lazy", Help: "lazy", Buckets: bounds}).(*histogram)
+		var start, done sync.WaitGroup
+		start.Add(1)
+		for b := range bounds {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				start.Wait()
+				h.ObserveWithExemplar(bounds[b]-0.5, Labels{"b": strconv.Itoa(b)})
+			}()
+		}
+		start.Done()
+		done.Wait()
+
+		m := &dto.Metric{}
+		if err := h.Write(m); err != nil {
+			t.Fatal(err)
+		}
+		for b, bucket := range m.Histogram.Bucket {
+			if bucket.Exemplar == nil {
+				t.Fatalf("round %d: the exemplar observed into bucket %d was lost", round, b)
+			}
 		}
 	}
 }

@@ -608,7 +608,6 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 	h.counts[1] = &histogramCounts{buckets: make([]uint64, len(h.upperBounds))}
 	atomic.StoreUint64(&h.counts[1].nativeHistogramZeroThresholdBits, math.Float64bits(h.nativeHistogramZeroThreshold))
 	atomic.StoreInt32(&h.counts[1].nativeHistogramSchema, h.nativeHistogramSchema)
-	h.exemplars = make([]atomic.Value, len(h.upperBounds)+1)
 
 	h.init(h) // Init self-collection.
 	return h
@@ -745,11 +744,14 @@ type histogram struct {
 	// http://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 	counts [2]*histogramCounts
 
-	upperBounds                     []float64
-	labelPairs                      []*dto.LabelPair
-	exemplars                       []atomic.Value // One more than buckets (to include +Inf), each a *dto.Exemplar.
-	nativeHistogramSchema           int32          // The initial schema. Set to math.MinInt32 if no sparse buckets are used.
-	nativeHistogramZeroThreshold    float64        // The initial zero threshold.
+	upperBounds []float64
+	labelPairs  []*dto.LabelPair
+	// One more than buckets (to include +Inf), each a *dto.Exemplar. Allocated
+	// by the first exemplar, see exemplarSlots: a histogram that never gets one,
+	// which is most of them, would otherwise carry 16 bytes a bucket for good.
+	exemplars                       atomic.Pointer[[]atomic.Value]
+	nativeHistogramSchema           int32   // The initial schema. Set to math.MinInt32 if no sparse buckets are used.
+	nativeHistogramZeroThreshold    float64 // The initial zero threshold.
 	nativeHistogramMaxZeroThreshold float64
 	nativeHistogramMaxBuckets       uint32
 	nativeHistogramMinResetDuration time.Duration
@@ -807,7 +809,7 @@ func (h *histogram) refill(out *dto.Metric, count uint64, sum float64, coldCount
 	if h.nativeHistogramSchema > math.MinInt32 || len(his.PositiveSpan) > 0 || len(his.NegativeSpan) > 0 {
 		return false
 	}
-	if h.exemplars[len(h.upperBounds)].Load() != nil {
+	if h.exemplarAt(len(h.upperBounds)) != nil {
 		return false
 	}
 	for i, upperBound := range h.upperBounds {
@@ -829,8 +831,8 @@ func (h *histogram) refill(out *dto.Metric, count uint64, sum float64, coldCount
 	for i := range h.upperBounds {
 		cumCount += atomic.LoadUint64(&coldCounts.buckets[i])
 		*his.Bucket[i].CumulativeCount = cumCount
-		if e := h.exemplars[i].Load(); e != nil {
-			his.Bucket[i].Exemplar = e.(*dto.Exemplar)
+		if e := h.exemplarAt(i); e != nil {
+			his.Bucket[i].Exemplar = e
 		}
 	}
 	out.Label = h.labelPairs
@@ -880,16 +882,16 @@ func (h *histogram) Write(out *dto.Metric) error {
 			CumulativeCount: proto.Uint64(cumCount),
 			UpperBound:      proto.Float64(upperBound),
 		}
-		if e := h.exemplars[i].Load(); e != nil {
-			his.Bucket[i].Exemplar = e.(*dto.Exemplar)
+		if e := h.exemplarAt(i); e != nil {
+			his.Bucket[i].Exemplar = e
 		}
 	}
 	// If there is an exemplar for the +Inf bucket, we have to add that bucket explicitly.
-	if e := h.exemplars[len(h.upperBounds)].Load(); e != nil {
+	if e := h.exemplarAt(len(h.upperBounds)); e != nil {
 		b := &dto.Bucket{
 			CumulativeCount: proto.Uint64(count),
 			UpperBound:      proto.Float64(math.Inf(1)),
-			Exemplar:        e.(*dto.Exemplar),
+			Exemplar:        e,
 		}
 		his.Bucket = append(his.Bucket, b)
 	}
@@ -1216,6 +1218,30 @@ func (h *histogram) resetCounts(counts *histogramCounts) {
 	deleteSyncMap(&counts.nativeHistogramBucketsPositive)
 }
 
+// exemplarAt returns the exemplar of classic bucket i, or nil.
+func (h *histogram) exemplarAt(i int) *dto.Exemplar {
+	if ex := h.exemplars.Load(); ex != nil {
+		if e := (*ex)[i].Load(); e != nil {
+			return e.(*dto.Exemplar)
+		}
+	}
+	return nil
+}
+
+// exemplarSlots returns the per-bucket exemplars, allocating them on first use.
+// Of two observers racing to allocate, the one that loses stores into the
+// winner's, so neither exemplar is lost.
+func (h *histogram) exemplarSlots() []atomic.Value {
+	if ex := h.exemplars.Load(); ex != nil {
+		return *ex
+	}
+	fresh := make([]atomic.Value, len(h.upperBounds)+1)
+	if h.exemplars.CompareAndSwap(nil, &fresh) {
+		return fresh
+	}
+	return *h.exemplars.Load()
+}
+
 // updateExemplar replaces the exemplar for the provided classic bucket.
 // With empty labels, it's a no-op. It panics if any of the labels is invalid.
 // If histogram is native, the exemplar will be cached into nativeExemplars,
@@ -1228,7 +1254,7 @@ func (h *histogram) updateExemplar(v float64, bucket int, l Labels) {
 	if err != nil {
 		panic(err)
 	}
-	h.exemplars[bucket].Store(e)
+	h.exemplarSlots()[bucket].Store(e)
 	doSparse := h.nativeHistogramSchema > math.MinInt32 && !math.IsNaN(v)
 	if doSparse {
 		h.nativeExemplars.addExemplar(e)
