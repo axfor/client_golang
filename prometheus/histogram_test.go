@@ -510,6 +510,29 @@ func TestHistogramExemplarsAllocatedOnFirstUse(t *testing.T) {
 	}
 }
 
+// A classic histogram keeps no native-histogram state: it is 112 bytes on each
+// of its two counts, and a classic one never reads it. A native one has it on
+// both, since the hot and cold counts swap on every Write.
+func TestNativeCountsOnlyOnNativeHistograms(t *testing.T) {
+	classic := NewHistogram(HistogramOpts{Name: "classic", Help: "c", Buckets: []float64{1, 2, 3}}).(*histogram)
+	native := NewHistogram(HistogramOpts{Name: "native", Help: "n", NativeHistogramBucketFactor: 1.1}).(*histogram)
+	for _, h := range []*histogram{classic, native} {
+		h.Observe(1.5)
+		if err := h.Write(&dto.Metric{}); err != nil {
+			t.Fatal(err)
+		}
+		h.Observe(0)
+	}
+	for i := range classic.counts {
+		if classic.counts[i].native != nil {
+			t.Errorf("classic histogram: counts[%d] carries native state", i)
+		}
+		if native.counts[i].native == nil {
+			t.Errorf("native histogram: counts[%d] has no native state", i)
+		}
+	}
+}
+
 func TestNativeHistogram(t *testing.T) {
 	now := time.Now()
 
@@ -2124,11 +2147,11 @@ func TestConstNativeHistogram(t *testing.T) {
 			consthist, err := NewConstNativeHistogram(_his.Desc(),
 				cold.count,
 				math.Float64frombits(cold.sumBits),
-				syncMapToMap(&cold.nativeHistogramBucketsPositive),
-				syncMapToMap(&cold.nativeHistogramBucketsNegative),
-				cold.nativeHistogramZeroBucket,
-				cold.nativeHistogramSchema,
-				math.Float64frombits(cold.nativeHistogramZeroThresholdBits),
+				syncMapToMap(&cold.native.nativeHistogramBucketsPositive),
+				syncMapToMap(&cold.native.nativeHistogramBucketsNegative),
+				cold.native.nativeHistogramZeroBucket,
+				cold.native.nativeHistogramSchema,
+				math.Float64frombits(cold.native.nativeHistogramZeroThresholdBits),
 				_his.lastResetTime,
 			)
 			if err != nil {
