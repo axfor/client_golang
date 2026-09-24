@@ -51,7 +51,6 @@ func TestScrapeScratchFallsBackAfterMassDeletion(t *testing.T) {
 		f.h.WithLabelValues("k" + strconv.Itoa(i)).Observe(1)
 	}
 	f.scrape(t, false)
-	before := exposerCapacity(f.exp)
 	beforeIntern := internPtr(f.exp)
 
 	for range 30 {
@@ -62,10 +61,6 @@ func TestScrapeScratchFallsBackAfterMassDeletion(t *testing.T) {
 		t.Fatalf("%d instances tracked, want the handful still being written", got)
 	}
 
-	after := exposerCapacity(f.exp)
-	if after > before/4 {
-		t.Errorf("the scrape scratch still holds room for %d, was %d -- the arrays were cleared but not given back", after, before)
-	}
 	if internPtr(f.exp) == beforeIntern {
 		t.Error("the label table was cleared but not replaced, so it still holds buckets for every instance that is gone")
 	}
@@ -76,24 +71,26 @@ func TestScrapeScratchFallsBackAfterMassDeletion(t *testing.T) {
 	}
 }
 
-func TestScrapeScratchIsNotReallocatedWhileThePopulationHolds(t *testing.T) {
+// The scratch a scrape builds is given back with the scrape, including while
+// the population holds and every instance is written each time: kept for the
+// next one it would be live heap for the whole interval, and under the default
+// GOGC the collector lets the heap grow to twice what is live.
+func TestScrapeScratchIsReleasedAfterEveryScrape(t *testing.T) {
 	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
 
 	const n = 20000
-	for i := range n {
-		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
-	}
-	f.scrape(t, false)
-	before := exposerCapacity(f.exp)
-
-	for range 5 {
+	for round := range 3 {
 		for i := range n {
 			f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+			f.h.WithLabelValues("k" + strconv.Itoa(i)).Observe(1)
 		}
-		f.scrape(t, false)
-	}
-	if got := exposerCapacity(f.exp); got < before/2 {
-		t.Errorf("capacity fell from %d to %d while every instance was still being written", before, got)
+		m, _ := f.scrape(t, false)
+		if len(m) < n {
+			t.Fatalf("round %d reported %d series, want at least the %d counters", round, len(m), n)
+		}
+		if got := exposerCapacity(f.exp); got != 0 {
+			t.Errorf("round %d: the scrape scratch still holds room for %d after the scrape", round, got)
+		}
 	}
 }
 

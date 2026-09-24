@@ -409,33 +409,13 @@ func TestNoDTOIsKeptBetweenScrapes(t *testing.T) {
 	}
 	f.scrape(t, false) // every counter is new, so every one is written
 
-	held := func() (rows, nums int) {
-		f.exp.mu.Lock()
-		defer f.exp.mu.Unlock()
-		if len(f.exp.fam.rows) != 0 || len(f.exp.fam.nums) != 0 || f.exp.fam.mf != nil {
-			t.Fatalf("a family is still held after the scrape: %d rows, %d values", len(f.exp.fam.rows), len(f.exp.fam.nums))
-		}
-		return cap(f.exp.fam.rows), cap(f.exp.fam.nums)
+	// The family arrays go with the scrape: kept for the next one they are live
+	// heap for the whole interval, sized by the widest scrape.
+	f.exp.mu.Lock()
+	if rows, nums := cap(f.exp.fam.rows), cap(f.exp.fam.nums); rows != 0 || nums != 0 || f.exp.fam.mf != nil {
+		t.Errorf("after the scrape the family arrays still hold room for %d rows and %d values", rows, nums)
 	}
-	beforeRows, beforeNums := held()
-	if beforeRows < keys {
-		t.Fatalf("the family arrays hold room for %d rows after a scrape that wrote %d; expected the room to be kept for now", beforeRows, keys)
-	}
-
-	// From here on only two counters move. The room has to fall back towards
-	// that: the first scrape after start-up writes every instance, and arrays
-	// left at that size would be the per-instance cost this is meant to avoid.
-	for range 40 {
-		f.c.WithLabelValues("0").Inc()
-		f.c.WithLabelValues("1").Inc()
-		f.scrape(t, false)
-	}
-	afterRows, afterNums := held()
-	// Down to the floor below which arrays are not worth shrinking.
-	if afterRows > minShrink || afterNums > minShrink {
-		t.Errorf("after 40 scrapes writing two instances the family arrays still hold room for %d rows and %d values, down from %d and %d",
-			afterRows, afterNums, beforeRows, beforeNums)
-	}
+	f.exp.mu.Unlock()
 
 	// And the values still come out right through the shared scratch.
 	f.c.WithLabelValues("7").Add(3)

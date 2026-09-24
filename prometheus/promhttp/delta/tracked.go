@@ -73,12 +73,6 @@ type TrackedExposer struct {
 	byName map[string]int // family name to its index in slots
 	fam    familyRows     // the family being written
 	enc    *encState
-
-	// Recent high-water marks, so the arrays behind these can be given back
-	// after idle cleanup instead of staying at the size they once needed.
-	takenPeak int
-	rowsPeak  int
-	numsPeak  int
 }
 
 // NewTracked returns an Exposer backed by change tracking. A nil t means
@@ -129,29 +123,6 @@ type idleEntry struct {
 // minShrink is the capacity below which giving an array back is not worth the
 // copy.
 const minShrink = 1 << 6
-
-// fallBack returns a slice with room for about peak elements when the one it is
-// given is holding an array far larger. Clearing a slice releases what it
-// pointed at but keeps the array, and these are all sized by the first scrape
-// after start-up, when every instance in the process is new and so is written.
-// The mark it is given decays, the way the dto free lists do, so a burst is let
-// go over a few scrapes while a steady load never reallocates.
-func fallBack[T any](s []T, peak int) []T {
-	if cap(s) < minShrink || cap(s) < 4*(peak+1) {
-		return s
-	}
-	return make([]T, 0, peak+peak/4+1)
-}
-
-// decay moves a high-water mark towards n, dropping an eighth of the way when n
-// is below it.
-func decay(mark *int, n int) {
-	if n > *mark {
-		*mark = n
-		return
-	}
-	*mark -= *mark / 8
-}
 
 // Handler returns an http.Handler.
 func (e *TrackedExposer) Handler() http.Handler {
@@ -236,28 +207,20 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 		}
 	}
 
-	// Clear to the capacity, not just the length. Truncating alone leaves the
-	// pointers in the backing arrays, and the first scrape after start-up sizes
-	// them to every instance the process has: idle cleanup then drops an entry
-	// from state and from its Vec while these keep it -- and its labels and the
-	// instance itself -- alive for the life of the process.
+	// The scrape's scratch goes with the scrape. It used to be kept for the next
+	// one, sized to a decaying high-water mark of recent scrapes, to save
+	// reallocating it once a minute; but kept, it is live heap for the whole
+	// minute in between, and under the default GOGC the collector lets the heap
+	// grow to twice what is live. At 2.1M instances with a quarter changing per
+	// scrape these arrays were over 100 MiB of each sidecar.
 	for i := range e.slots {
-		s := &e.slots[i]
-		clear(s.picks[:cap(s.picks)])
-		decay(&s.peak, len(s.picks))
-		s.picks = fallBack(s.picks, s.peak)[:0]
+		e.slots[i].picks = nil
 		if i >= e.nslots {
-			s.desc = nil
+			e.slots[i].desc = nil
 		}
 	}
-	decay(&e.rowsPeak, e.fam.rowsHigh)
-	decay(&e.numsPeak, e.fam.numsHigh)
-	e.fam.rows = fallBack(e.fam.rows, e.rowsPeak)[:0]
-	e.fam.nums = fallBack(e.fam.nums, e.numsPeak)[:0]
-	e.fam.rowsHigh, e.fam.numsHigh = 0, 0
-	clear(e.taken[:cap(e.taken)])
-	decay(&e.takenPeak, len(e.taken))
-	e.taken = fallBack(e.taken, e.takenPeak)[:0]
+	e.fam.rows, e.fam.nums = nil, nil
+	e.taken = nil
 	st.Deleted = e.drop(idle)
 	return st
 }

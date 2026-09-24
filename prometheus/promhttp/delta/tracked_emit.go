@@ -62,7 +62,6 @@ type pick struct {
 type familySlot struct {
 	desc  *prometheus.Desc
 	picks []pick
-	peak  int // recent high-water mark of len(picks), so the array can fall back
 }
 
 // frow is one instance of the family being written. Its values are
@@ -120,10 +119,6 @@ type familyRows struct {
 	genAt  int
 	rows   []frow
 	nums   []float64
-
-	// The largest family written this scrape, so Serve can let the arrays fall
-	// back to what a scrape needs rather than to what one family once did.
-	rowsHigh, numsHigh int
 }
 
 // start begins a family with header mf.
@@ -235,7 +230,6 @@ func (fr *familyRows) encode(w *bufio.Writer, enc expfmt.Encoder, es *encState, 
 // rows reference entries and label slices, so they are cleared rather than only
 // truncated: a family written once and not again would keep them alive.
 func (fr *familyRows) reset() {
-	fr.rowsHigh, fr.numsHigh = max(fr.rowsHigh, len(fr.rows)), max(fr.numsHigh, len(fr.nums))
 	clear(fr.rows)
 	fr.rows, fr.nums, fr.mf, fr.sh = fr.rows[:0], fr.nums[:0], nil, nil
 }
