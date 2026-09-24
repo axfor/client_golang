@@ -284,7 +284,12 @@ type Exposer struct {
 }
 
 type entry struct {
-	kind      dto.MetricType
+	kind dto.MetricType
+	// Creation time in Unix seconds, the value of GenLabel. Seconds fit in 32
+	// bits until 2106, and next to kind they fill the word kind was padded to:
+	// that is what takes the entry from 120 bytes to 112, a size class down.
+	born uint32
+
 	value     float64  // counter / gauge: last delivered value
 	sum       float64  // histogram: last delivered _sum
 	count     uint64   // histogram: last delivered _count
@@ -297,13 +302,11 @@ type entry struct {
 	// configurations never set.
 	del *deleteKey
 
-	born int64 // creation time in Unix seconds, the value of GenLabel
-
 	// The rendered labels of this series, without the closing brace, plus the
 	// generation they were rendered under. Shared with every other entry of the
 	// same instance, see encState.share.
 	rendered    string
-	renderedGen int64
+	renderedGen uint32 // Unix seconds, as born
 	// What only some configurations need, allocated when one of them first
 	// does. Stamping the generation on the dto is the Gather path only -- the
 	// cached encoder writes it into the label string it keeps -- and the bases
@@ -429,7 +432,7 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 			e.keyBuf = appendSeriesKey(e.keyBuf[:0], mf.GetName(), m.Label)
 			en := e.state[string(e.keyBuf)]
 			if en == nil {
-				en = &entry{kind: mf.GetType(), changed: e.round, born: e.rb.clock().Unix()}
+				en = &entry{kind: mf.GetType(), changed: e.round, born: uint32(e.rb.clock().Unix())}
 				if e.opts.Delete != nil {
 					en.del = &deleteKey{family: mf.GetName(), labels: labelsOf(m.Label)}
 				}

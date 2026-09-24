@@ -80,10 +80,10 @@ func (rb *rebaseState) delivered() {
 // genOf returns the generation a series reports under: its own creation time, or
 // the generation of the last rebase when the series is older than it.
 func (rb *rebaseState) genOf(en *entry) int64 {
-	if rb.gen != 0 && en.born < rb.gen {
+	if rb.gen != 0 && int64(en.born) < rb.gen {
 		return rb.gen
 	}
-	return en.born
+	return int64(en.born)
 }
 
 // rebaseEntry brings an entry into the current generation the first time it is

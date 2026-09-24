@@ -86,7 +86,7 @@ func (e *TrackedExposer) pick(m prometheus.Metric, reason pickReason) {
 	desc := m.Desc()
 	fresh := en == nil
 	if fresh {
-		en = &entry{changed: e.round, born: e.rb.clock().Unix()}
+		en = &entry{changed: e.round, born: uint32(e.rb.clock().Unix())}
 		*slot = unsafe.Pointer(en)
 		e.live++
 	}
@@ -187,14 +187,14 @@ func (fr *familyRows) add(m *dto.Metric, en *entry, gen int64, es *encState) {
 			fr.cached = false
 		}
 	}
-	if fr.cached && (en.rendered == "" || en.renderedGen != gen) {
+	if fr.cached && (en.rendered == "" || int64(en.renderedGen) != gen) {
 		if fr.genAt >= 0 {
 			fr.extra[fr.genAt].value = strconv.FormatInt(gen, 10)
 		}
 		rendered, ok := buildLabels(es.buf[:0], m, fr.extra)
 		if ok {
 			es.buf = rendered // keep the grown scratch
-			en.rendered, en.renderedGen = es.share(rendered), gen
+			en.rendered, en.renderedGen = es.share(rendered), uint32(gen)
 		} else {
 			fr.cached = false
 		}

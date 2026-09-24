@@ -24,6 +24,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 	"weak"
 
 	dto "github.com/prometheus/client_model/go"
@@ -764,6 +765,16 @@ func TestScrapeScratchHoldsNothingAfterTheScrape(t *testing.T) {
 			t.Fatalf("taken still holds a metric at index %d, past its length %d (cap %d)",
 				j, len(f.exp.taken), cap(f.exp.taken))
 		}
+	}
+}
+
+// There is one entry per instance, millions of them, and the allocator rounds
+// each up to its size class: a field that takes the entry past 112 bytes costs
+// 16 on every instance, not the field's own width. Growing it should be a
+// decision, not a side effect.
+func TestEntryStaysInItsSizeClass(t *testing.T) {
+	if n := unsafe.Sizeof(entry{}); n > 112 {
+		t.Errorf("entry is %d bytes, past the 112-byte size class", n)
 	}
 }
 
