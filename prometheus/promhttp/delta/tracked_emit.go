@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"math"
 	"strconv"
+	"unsafe"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -78,12 +79,16 @@ type frow struct {
 
 // pick records m for this scrape, creating its entry if it is new.
 func (e *TrackedExposer) pick(m prometheus.Metric, reason pickReason) {
+	en, slot := entryOf(m)
+	if slot == nil {
+		return // deleted from its Vec since it was taken
+	}
 	desc := m.Desc()
-	en := e.state[m]
 	fresh := en == nil
 	if fresh {
-		en = &entry{family: desc.Name(), changed: e.round, born: e.rb.clock().Unix()}
-		e.state[m] = en
+		en = &entry{changed: e.round, born: e.rb.clock().Unix()}
+		*slot = unsafe.Pointer(en)
+		e.live++
 	}
 	en.lastRound = e.round
 
@@ -277,8 +282,8 @@ func (e *TrackedExposer) emitFamily(s *familySlot, w *bufio.Writer, enc expfmt.E
 		// are handed to Options.Delete, which looks the child up in its Vec, and
 		// the Vec has no generation label. Only needed when there is a callback;
 		// without one idle cleanup goes through prometheus.DeleteTracked.
-		if en.labels == nil && e.opts.Delete != nil {
-			en.labels = labelsOf(m.Label)
+		if en.del == nil && e.opts.Delete != nil {
+			en.del = &deleteKey{family: name, labels: labelsOf(m.Label)}
 		}
 		emit, _, pc := e.decide(fr.mf, m, en)
 		if pc != nil {

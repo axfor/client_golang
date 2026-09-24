@@ -16,6 +16,7 @@ package delta
 import (
 	"net/http"
 	"sync"
+	"unsafe"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -52,7 +53,10 @@ type TrackedExposer struct {
 
 	mu    sync.Mutex
 	round uint64
-	state map[prometheus.Metric]*entry
+	// Each instance's entry is kept in the instance's own tracker slot, see
+	// entryOf, rather than in a map from instance to entry: at two million
+	// instances such a map is about 40 bytes an instance on top of the entries.
+	live int // entries created and not dropped as idle, for Tracked
 	// scratch is the dto each family's instances are written into, one after
 	// another, see tracked_emit.go. One per family rather than one for all, so
 	// that Write finds the family's shape already there and updates it in place
@@ -72,7 +76,6 @@ type TrackedExposer struct {
 
 	// Recent high-water marks, so the arrays behind these can be given back
 	// after idle cleanup instead of staying at the size they once needed.
-	statePeak int
 	takenPeak int
 	rowsPeak  int
 	numsPeak  int
@@ -89,7 +92,6 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 	return &TrackedExposer{
 		opts:    opts,
 		tracker: t,
-		state:   map[prometheus.Metric]*entry{},
 		scratch: map[string]*dto.Metric{},
 		byName:  map[string]int{},
 		enc:     newEncState(),
@@ -104,7 +106,24 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 func (e *TrackedExposer) Tracked() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return len(e.state)
+	return e.live
+}
+
+// entryOf returns m's entry, nil when it has none yet, and the slot it is kept
+// in, nil when m is no longer tracked.
+func entryOf(m prometheus.Metric) (*entry, *unsafe.Pointer) {
+	slot := prometheus.TrackerSlot(m)
+	if slot == nil {
+		return nil, nil
+	}
+	return (*entry)(*slot), slot
+}
+
+// idleEntry is an instance idle cleanup is about to drop.
+type idleEntry struct {
+	m    prometheus.Metric
+	slot *unsafe.Pointer
+	en   *entry
 }
 
 // minShrink is the capacity below which giving an array back is not worth the
@@ -152,7 +171,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	clear(e.byName)
 	e.nslots = 0
 	e.taken = e.taken[:0]
-	var idle []*entry
+	var idle []idleEntry
 
 	// First pass: take what is due, grouped by family, without writing any of it.
 	//
@@ -163,13 +182,12 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	if !e.opts.DisableHeartbeat || e.opts.IdleScrapes > 0 {
 		bucket := int(e.round % uint64(e.opts.HeartbeatScrapes))
 		e.tracker.RangeBucket(bucket, e.opts.HeartbeatScrapes, func(m prometheus.Metric) {
-			en := e.state[m]
+			en, slot := entryOf(m)
 			if en == nil {
 				return // a new instance not taken yet; leave it for the next scrape
 			}
 			if e.opts.IdleScrapes > 0 && e.round-en.changed > uint64(e.opts.IdleScrapes) && deletable(en) {
-				idle = append(idle, en)
-				en.metric = m
+				idle = append(idle, idleEntry{m: m, slot: slot, en: en})
 				en.lastRound = e.round // handled this scrape: do not also top it up below
 				return
 			}
@@ -184,8 +202,8 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	// This is what the Gather path does too, see Exposer.decide.
 	for i := 0; e.opts.Only.carries(dto.MetricType_GAUGE) && i < len(e.gauges); {
 		m := e.gauges[i]
-		en := e.state[m]
-		if en == nil { // dropped as idle; a new child registers itself again
+		en, _ := entryOf(m)
+		if en == nil { // dropped as idle or deleted; a new child registers itself again
 			e.gauges[i] = e.gauges[len(e.gauges)-1]
 			e.gauges[len(e.gauges)-1] = nil
 			e.gauges = e.gauges[:len(e.gauges)-1]
@@ -255,62 +273,32 @@ func (e *TrackedExposer) commit(pending []pendingCommit) {
 		pc.en.sum = pc.sum
 		pc.en.count = pc.count
 		if pc.buckets != nil {
-			pc.en.spare = pc.en.buckets
 			pc.en.buckets = pc.buckets
 		}
 	}
 }
 
 // drop removes idle instances from their Vec, through Options.Delete when one is
-// set and through prometheus.DeleteTracked otherwise. Either way the instance
-// leaves the tracking table with it.
-func (e *TrackedExposer) drop(idle []*entry) int {
-	for _, en := range idle {
+// set and through prometheus.DeleteTracked otherwise, and lets go of their
+// entries.
+func (e *TrackedExposer) drop(idle []idleEntry) int {
+	for _, x := range idle {
 		if e.opts.Delete != nil {
-			e.opts.Delete(en.family, en.labels)
+			family, labels := x.m.Desc().Name(), prometheus.Labels(nil)
+			if d := x.en.del; d != nil {
+				family, labels = d.family, d.labels
+			}
+			e.opts.Delete(family, labels)
 		} else {
-			prometheus.DeleteTracked(en.metric)
+			prometheus.DeleteTracked(x.m)
 		}
-		delete(e.state, en.metric)
-		en.metric = nil
+		// Cleared whichever way it went: a Delete that left the child in place
+		// must see it start over as new, as it did when the entry left a map.
+		*x.slot = nil
+		e.live--
 	}
-	e.shrinkState()
 	return len(idle)
 }
-
-// shrinkState rebuilds the state map once it is holding far fewer instances
-// than it was sized for. A Go map never gives its buckets back: delete leaves
-// the array at the high-water mark, which here is every instance the process
-// had before idle cleanup ran. At 30k keys that mark is about a million, and
-// the map alone stays at 45MB to hold the 88k that are left.
-//
-// The mark decays the way the dto free lists do, so a burst is given up over a
-// few scrapes rather than pinned for the life of the process, and a rebuild
-// only happens when what is left is less than half of it -- copying the live
-// entries costs an allocation and one insert each, which at a steady
-// population never happens twice.
-func (e *TrackedExposer) shrinkState() {
-	if n := len(e.state); n > e.statePeak {
-		e.statePeak = n
-		return
-	}
-	// The mark does not decay. A population that drains gradually still has to
-	// be given back, and a mark that falls as fast as the drain is re-pinned
-	// every scrape and never gets two times above it -- only a collapse inside
-	// one scrape would ever fire. It resets on the rebuild below instead.
-	if len(e.state) >= e.statePeak/2 || e.statePeak < minShrinkState {
-		return
-	}
-	fresh := make(map[prometheus.Metric]*entry, len(e.state))
-	for m, en := range e.state {
-		fresh[m] = en
-	}
-	e.state = fresh
-	e.statePeak = len(e.state)
-}
-
-// Below this the buckets are not worth the copy.
-const minShrinkState = 1 << 12
 
 func metricType(m *dto.Metric) *dto.MetricType {
 	var t dto.MetricType

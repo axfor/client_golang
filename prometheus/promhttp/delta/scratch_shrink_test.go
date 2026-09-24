@@ -97,41 +97,11 @@ func TestScrapeScratchIsNotReallocatedWhileThePopulationHolds(t *testing.T) {
 	}
 }
 
-// The first version of all three of these passed a test that only asked
+// The first version of these passed a test that only asked
 // whether the map object had been replaced. It had -- with one sized from the
 // decayed mark, so the replacement was larger than what it replaced, and the
 // mark was then set low enough that it never fired again. What has to be
 // asserted is that the thing shrinks and keeps shrinking.
-
-// A population that drains gradually has to be given back too. A mark that
-// decays as fast as the drain is re-pinned every scrape and never gets two
-// times above it, so only a collapse inside a single scrape would ever fire.
-func TestStateMapIsRebuiltAfterAGradualDrain(t *testing.T) {
-	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
-
-	const n = minShrinkState + 4000
-	live := make([]string, 0, n)
-	for i := range n {
-		k := "k" + strconv.Itoa(i)
-		live = append(live, k)
-		f.c.WithLabelValues(k).Inc()
-	}
-	f.scrape(t, false)
-	before := mapPtr(f.exp)
-
-	// Drain a tenth of the population per scrape -- slower than any decay a
-	// mark could sensibly use.
-	for len(live) > n/8 {
-		live = live[:len(live)-len(live)/10]
-		for _, k := range live {
-			f.c.WithLabelValues(k).Inc()
-		}
-		f.scrape(t, false)
-	}
-	if mapPtr(f.exp) == before {
-		t.Errorf("the state map drained from %d to %d without being rebuilt", n, f.exp.Tracked())
-	}
-}
 
 // After a rebuild the mark has to sit at what is actually there. A Go map does
 // not expose its capacity, so the size the replacement is made with can only be

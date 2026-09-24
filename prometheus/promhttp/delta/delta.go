@@ -284,17 +284,18 @@ type Exposer struct {
 }
 
 type entry struct {
-	family    string
-	labels    prometheus.Labels
 	kind      dto.MetricType
-	value     float64           // counter / gauge: last delivered value
-	sum       float64           // histogram: last delivered _sum
-	count     uint64            // histogram: last delivered _count
-	metric    prometheus.Metric // the instance, on the change-tracking path
-	buckets   []uint64          // histogram: last delivered cumulative count per le
-	spare     []uint64          // buffer rotated with buckets
-	changed   uint64            // last scrape whose value differed from the delivered one
-	lastRound uint64            // last scrape this was seen in
+	value     float64  // counter / gauge: last delivered value
+	sum       float64  // histogram: last delivered _sum
+	count     uint64   // histogram: last delivered _count
+	buckets   []uint64 // histogram: last delivered cumulative count per le
+	changed   uint64   // last scrape whose value differed from the delivered one
+	lastRound uint64   // last scrape this was seen in
+
+	// What Options.Delete is called with; nil unless one is set. The family and
+	// labels were held inline on every entry, 24 bytes, for a callback most
+	// configurations never set.
+	del *deleteKey
 
 	born int64 // creation time in Unix seconds, the value of GenLabel
 
@@ -310,6 +311,11 @@ type entry struct {
 	// them inline cost 96 of the entry's 264 bytes on every instance of every
 	// configuration, whether or not it had any use for them.
 	extra *entryExtra
+}
+
+type deleteKey struct {
+	family string
+	labels prometheus.Labels
 }
 
 type entryExtra struct {
@@ -423,9 +429,9 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 			e.keyBuf = appendSeriesKey(e.keyBuf[:0], mf.GetName(), m.Label)
 			en := e.state[string(e.keyBuf)]
 			if en == nil {
-				en = &entry{family: mf.GetName(), kind: mf.GetType(), changed: e.round, born: e.rb.clock().Unix()}
+				en = &entry{kind: mf.GetType(), changed: e.round, born: e.rb.clock().Unix()}
 				if e.opts.Delete != nil {
-					en.labels = labelsOf(m.Label)
+					en.del = &deleteKey{family: mf.GetName(), labels: labelsOf(m.Label)}
 				}
 				e.state[string(e.keyBuf)] = en
 			}
@@ -469,7 +475,7 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		if changed {
 			en.changed = e.round
 		}
-		if !changed && !e.heartbeatTurn(en) {
+		if !changed && !e.heartbeatTurn(mf.GetName(), en) {
 			return false, false, nil
 		}
 		e.rb.rebaseEntry(en)
@@ -489,18 +495,22 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 			return true, false, nil
 		}
 		sum, count := h.GetSampleSum(), h.GetSampleCount()
-		buckets := en.spare[:0]
-		if cap(buckets) < len(h.Bucket) {
-			buckets = make([]uint64, 0, len(h.Bucket))
-		}
-		for _, b := range h.Bucket {
-			buckets = append(buckets, b.GetCumulativeCount())
-		}
+		// Count and sum unchanged means no observation, so the buckets are the
+		// delivered ones and there is nothing of them to commit. Those that did
+		// change go in a slice of their own, which the entry adopts once they are
+		// delivered: keeping a second buffer on every entry to rotate with cost 24
+		// bytes on each and a bucket array on most histograms, for the part of a
+		// scrape between reading a value and delivering it.
+		var buckets []uint64
 		changed := count != en.count || sum != en.sum
 		if changed {
 			en.changed = e.round
+			buckets = make([]uint64, len(h.Bucket))
+			for i, b := range h.Bucket {
+				buckets[i] = b.GetCumulativeCount()
+			}
 		}
-		if !changed && !e.heartbeatTurn(en) {
+		if !changed && !e.heartbeatTurn(mf.GetName(), en) {
 			return false, false, nil
 		}
 		e.rb.rebaseEntry(en)
@@ -583,12 +593,17 @@ func deletable(en *entry) bool {
 	return en.kind != dto.MetricType_GAUGE || en.value == 0
 }
 
-// heartbeatTurn reports whether an unchanged series is due for a top-up.
-func (e *Exposer) heartbeatTurn(en *entry) bool {
+// heartbeatTurn reports whether an unchanged series of family is due for a
+// top-up.
+func (e *Exposer) heartbeatTurn(family string, en *entry) bool {
 	if e.opts.DisableHeartbeat {
 		return false
 	}
-	return int(e.round%uint64(e.opts.HeartbeatScrapes)) == int(hash(en.family, en.labels)%uint64(e.opts.HeartbeatScrapes))
+	var labels prometheus.Labels
+	if en.del != nil {
+		labels = en.del.labels
+	}
+	return int(e.round%uint64(e.opts.HeartbeatScrapes)) == int(hash(family, labels)%uint64(e.opts.HeartbeatScrapes))
 }
 
 // commit records the values read this scrape as the last delivered ones.
@@ -598,7 +613,6 @@ func (e *Exposer) commit(pending []pendingCommit) {
 		pc.en.sum = pc.sum
 		pc.en.count = pc.count
 		if pc.buckets != nil {
-			pc.en.spare = pc.en.buckets // rotate the two buffers instead of reallocating
 			pc.en.buckets = pc.buckets
 		}
 	}
@@ -615,7 +629,7 @@ func (e *Exposer) sweep() int {
 		if en.lastRound == e.round && e.round-en.changed > idle && deletable(en) {
 			delete(e.state, k)
 			if e.opts.Delete != nil {
-				e.opts.Delete(en.family, en.labels)
+				e.opts.Delete(en.del.family, en.del.labels)
 			}
 			n++
 		}

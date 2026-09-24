@@ -15,6 +15,7 @@ package delta
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"net/http/httptest"
 	"sort"
@@ -268,6 +269,41 @@ func TestChangeOnlyWithHeartbeat(t *testing.T) {
 	}
 	if seen == 0 || seen == 4 {
 		t.Fatalf("an unchanged series should be topped up every 2 scrapes, got %d in 4", seen)
+	}
+}
+
+// Unchanged series are topped up in turns, one bucket of families per scrape, so
+// that a heartbeat round does not send everything at once: over HeartbeatScrapes
+// scrapes each family goes out exactly once, and not all of them in the same one.
+func TestHeartbeatsAreSpreadAcrossFamilies(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	const families, every = 12, 3
+	for i := range families {
+		v := prometheus.NewCounterVec(prometheus.CounterOpts{Name: fmt.Sprintf("f%02d_total", i), Help: "f"}, []string{"key"})
+		reg.MustRegister(v)
+		v.WithLabelValues("a").Inc()
+	}
+	f := &fixture{reg: reg, exp: New(reg, Options{HeartbeatScrapes: every})}
+	f.scrape(t, false) // all new, all written
+
+	seen := map[string]int{}
+	busy := 0 // scrapes that carried any heartbeat
+	for range every {
+		m, _ := f.scrape(t, false)
+		if len(m) > 0 {
+			busy++
+		}
+		for k := range m {
+			seen[k]++
+		}
+	}
+	for i := range families {
+		if k := fmt.Sprintf("f%02d_total{key=a}", i); seen[k] != 1 {
+			t.Errorf("%s was topped up %d times in %d scrapes, want once", k, seen[k], every)
+		}
+	}
+	if busy < 2 {
+		t.Errorf("every heartbeat went out in the same scrape (%d of %d carried any)", busy, every)
 	}
 }
 

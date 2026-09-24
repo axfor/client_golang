@@ -17,13 +17,14 @@ import (
 	"context"
 	"math/rand"
 	"net/http/httptest"
-	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"weak"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -459,10 +460,14 @@ func TestNoSideStructWhenNothingNeedsOne(t *testing.T) {
 	}
 
 	var with, total int
-	for _, en := range f.exp.state {
-		total++
-		if en.extra != nil {
-			with++
+	for i := range 50 {
+		for _, m := range []any{f.c.WithLabelValues(strconv.Itoa(i)), f.h.WithLabelValues(strconv.Itoa(i))} {
+			if en := entryFor(t, m); en != nil {
+				total++
+				if en.extra != nil {
+					with++
+				}
+			}
 		}
 	}
 	if total == 0 {
@@ -486,10 +491,8 @@ func TestSideStructAppearsOnceTheGenerationMoves(t *testing.T) {
 
 	f.c.WithLabelValues("a").Add(60)
 	f.scrape(t, false)
-	for _, en := range f.exp.state {
-		if en.extra != nil {
-			t.Fatal("no gap has happened yet, so there is no generation to keep a base for")
-		}
+	if en := entryFor(t, f.c.WithLabelValues("a")); en == nil || en.extra != nil {
+		t.Fatal("no gap has happened yet, so there is no generation to keep a base for")
 	}
 
 	now = time.Unix(1000+46*60, 0) // longer than RebaseAfterGap
@@ -497,10 +500,8 @@ func TestSideStructAppearsOnceTheGenerationMoves(t *testing.T) {
 	if _, st := f.scrape(t, false); !st.Rebased {
 		t.Fatalf("46 minutes since the last delivery: the generation should have moved (%+v)", st)
 	}
-	for _, en := range f.exp.state {
-		if en.extra == nil {
-			t.Error("the generation moved and the entry has nowhere to keep its base")
-		}
+	if en := entryFor(t, f.c.WithLabelValues("a")); en == nil || en.extra == nil {
+		t.Error("the generation moved and the entry has nowhere to keep its base")
 	}
 }
 
@@ -766,73 +767,80 @@ func TestScrapeScratchHoldsNothingAfterTheScrape(t *testing.T) {
 	}
 }
 
-// mapPtr identifies the map object itself, so a test can tell a rebuilt map
-// from one that was only emptied.
-func mapPtr(e *TrackedExposer) uintptr {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return reflect.ValueOf(e.state).Pointer()
+// entryFor returns the entry the exposer keeps for m, a child of one of the
+// fixture's Vecs, or nil when it has none.
+func entryFor(t *testing.T, m any) *entry {
+	t.Helper()
+	pm, ok := m.(prometheus.Metric)
+	if !ok {
+		t.Fatalf("%T is not a prometheus.Metric", m)
+	}
+	en, _ := entryOf(pm)
+	return en
 }
 
-// A Go map never returns its buckets: delete leaves the array at the size the
-// map once needed, which for a sidecar is every instance it held before idle
-// cleanup ran. The count read right, the heap did not -- so this asserts the
-// map object was replaced, which is the only way the buckets go back.
-func TestStateMapIsRebuiltAfterMassDeletion(t *testing.T) {
+// An entry is kept in its instance's tracker slot, so it has to go when the
+// instance goes -- dropped as idle, or deleted from its Vec by the application,
+// which the map from instance to entry this replaced kept for good -- and
+// nothing else may hold it once it has.
+func TestEntryGoesWithItsInstance(t *testing.T) {
 	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
-
-	const n = minShrinkState + 1000
-	for i := range n {
-		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+	for _, k := range []string{"keep", "idle", "deleted"} {
+		f.c.WithLabelValues(k).Inc()
 	}
 	f.scrape(t, false)
-	if got := f.exp.Tracked(); got != n {
-		t.Fatalf("tracked %d instances, want %d", got, n)
-	}
-	before := mapPtr(f.exp)
-
-	// Keep one alive so the map is not simply empty.
-	for range 5 {
-		f.c.WithLabelValues("k0").Inc()
-		f.scrape(t, false)
-	}
-	if got := f.exp.Tracked(); got != 1 {
-		t.Fatalf("tracked %d instances after the rest aged out, want 1", got)
-	}
-	if mapPtr(f.exp) == before {
-		t.Error("the state map was emptied but not rebuilt, so it still holds buckets for every instance that is gone")
-	}
-
-	// The survivor has to come through the rebuild with its state intact.
-	f.c.WithLabelValues("k0").Add(2)
-	if m, _ := f.scrape(t, false); m[`c_total{key=k0}`] != 2 {
-		t.Fatalf("the surviving instance should report the increment since the last scrape: %v", m)
-	}
-}
-
-// And a population that is merely quiet must not be rebuilt on every scrape:
-// the copy is only worth it when most of the map is gone.
-func TestStateMapIsNotRebuiltWhileThePopulationHolds(t *testing.T) {
-	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
-
-	const n = minShrinkState + 1000
-	for i := range n {
-		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
-	}
-	f.scrape(t, false)
-	before := mapPtr(f.exp)
-
-	// Every instance stays active, so nothing ages out and nothing is copied.
-	for range 6 {
-		for i := range n {
-			f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
+	weakOf := func(k string) weak.Pointer[entry] {
+		en := entryFor(t, f.c.WithLabelValues(k))
+		if en == nil {
+			t.Fatalf("%s has no entry after it was reported", k)
 		}
+		return weak.Make(en)
+	}
+	idle, deleted := weakOf("idle"), weakOf("deleted")
+	f.c.DeleteLabelValues("deleted")
+
+	for range 5 {
+		f.c.WithLabelValues("keep").Inc()
 		f.scrape(t, false)
 	}
-	if f.exp.Tracked() != n {
-		t.Fatalf("tracked %d, want %d -- nothing should have aged out", f.exp.Tracked(), n)
+	runtime.GC()
+	if idle.Value() != nil {
+		t.Error("the entry of an instance dropped as idle is still reachable")
 	}
-	if mapPtr(f.exp) != before {
-		t.Error("the state map was rebuilt while its population held, which pays the copy for nothing")
+	if deleted.Value() != nil {
+		t.Error("the entry of an instance the application deleted from its Vec is still reachable")
+	}
+
+	f.c.WithLabelValues("keep").Add(2)
+	if m, _ := f.scrape(t, false); m[`c_total{key=keep}`] != 2 {
+		t.Fatalf("the instance that stayed should report the increment since the last scrape: %v", m)
+	}
+}
+
+// With Options.Delete the child leaves its Vec only if the callback removes it.
+// One that stays has to start over as a new instance, the way it did when its
+// entry left a map, not carry on from the entry idle cleanup was done with.
+func TestIdleEntryIsLetGoWhenDeleteKeepsTheChild(t *testing.T) {
+	var deleted []string
+	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1,
+		Delete: func(family string, labels prometheus.Labels) { deleted = append(deleted, labels["key"]) }})
+	f.c.WithLabelValues("keep").Inc()
+	f.c.WithLabelValues("idle").Inc()
+	f.scrape(t, false)
+	old := weak.Make(entryFor(t, f.c.WithLabelValues("idle")))
+
+	for range 5 {
+		f.c.WithLabelValues("keep").Inc()
+		f.scrape(t, false)
+	}
+	if len(deleted) != 1 || deleted[0] != "idle" {
+		t.Fatalf("Delete was called for %v, want [idle]", deleted)
+	}
+	if n := f.exp.Tracked(); n != 1 {
+		t.Fatalf("tracked %d after idle cleanup, want 1", n)
+	}
+	runtime.GC()
+	if old.Value() != nil {
+		t.Error("the entry idle cleanup was done with is still held by the child the callback kept")
 	}
 }
