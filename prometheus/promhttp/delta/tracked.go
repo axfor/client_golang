@@ -193,7 +193,6 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	for i := 0; i < e.nslots && st.Err == nil; i++ {
 		st.Err = e.emitFamily(&e.slots[i], rs.w, enc, &st, &pending)
 	}
-	e.enc.resetIntern()
 	st.Err, st.Delivered = rs.close(st.Err, r)
 
 	if st.Delivered {
@@ -219,7 +218,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 			e.slots[i].desc = nil
 		}
 	}
-	e.fam.rows, e.fam.nums = nil, nil
+	e.fam.rows, e.fam.nums, e.fam.text = nil, nil, nil
 	e.taken = nil
 	st.Deleted = e.drop(idle)
 	return st

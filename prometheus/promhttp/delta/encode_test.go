@@ -19,7 +19,6 @@ import (
 	"math"
 	"strings"
 	"testing"
-	"unsafe"
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -296,40 +295,5 @@ func TestGenerationLabelIsSorted(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// Every family one instance appears in renders the same labels. Holding a copy
-// per entry was 15% of the heap of a sidecar with 30k keys, so entries built in
-// one scrape share the one string.
-func TestLabelsAreSharedBetweenFamilies(t *testing.T) {
-	labels := []*dto.LabelPair{lp("key", "a"), lp("zone", "b")}
-	mfs := []*dto.MetricFamily{
-		family("c_total", "", dto.MetricType_COUNTER,
-			&dto.Metric{Label: labels, Counter: &dto.Counter{Value: proto.Float64(1)}}),
-		family("d_total", "", dto.MetricType_COUNTER,
-			&dto.Metric{Label: labels, Counter: &dto.Counter{Value: proto.Float64(2)}}),
-	}
-	rows := [][]*entry{{{born: 7}}, {{born: 7}}}
-
-	var out bytes.Buffer
-	w := bufio.NewWriter(&out)
-	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
-	es := newEncState()
-	if err := encodeFamilies(w, enc, mfs, rows, func(en *entry) int64 { return int64(en.born) }, es, "gen", ""); err != nil {
-		t.Fatal(err)
-	}
-	w.Flush()
-
-	a, b := rows[0][0].rendered, rows[1][0].rendered
-	if a != b || a == "" {
-		t.Fatalf("the two entries should hold equal labels: %q vs %q", a, b)
-	}
-	if unsafe.StringData(a) != unsafe.StringData(b) {
-		t.Errorf("the two entries hold separate copies of %q; they should share one", a)
-	}
-	// The table is scrape-scoped, so nothing accumulates across scrapes.
-	if len(es.intern) != 0 {
-		t.Errorf("the intern table should be empty after the scrape, has %d", len(es.intern))
 	}
 }

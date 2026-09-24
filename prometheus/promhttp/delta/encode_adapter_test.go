@@ -25,7 +25,6 @@ import (
 // rather than going through a registry. rows[i] are the entries behind
 // mfs[i].Metric; a missing one sends the family to expfmt, as a scrape would.
 func encodeFamilies(w *bufio.Writer, enc expfmt.Encoder, mfs []*dto.MetricFamily, rows [][]*entry, gen func(*entry) int64, es *encState, genLabel, typeLabel string) error {
-	defer es.resetIntern()
 	var fr familyRows
 	for i, mf := range mfs {
 		if len(mf.Metric) == 0 {

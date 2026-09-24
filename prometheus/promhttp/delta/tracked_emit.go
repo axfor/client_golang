@@ -74,6 +74,9 @@ type frow struct {
 	ts     int64
 	hasTs  bool
 	off, n int32
+	// On the cached path, its rendered labels without the closing brace:
+	// familyRows.text[text:text+textLen].
+	text, textLen int32
 }
 
 // pick records m for this scrape, creating its entry if it is new.
@@ -119,6 +122,11 @@ type familyRows struct {
 	genAt  int
 	rows   []frow
 	nums   []float64
+	// The rendered labels of every row, built as the rows are added. An entry
+	// used to keep its own rendered string between scrapes, shared between the
+	// families of one instance: over 50 bytes an instance, held for the life of
+	// the instance, to spare re-rendering the few that change in a scrape.
+	text []byte
 }
 
 // start begins a family with header mf.
@@ -126,7 +134,7 @@ func (fr *familyRows) start(mf *dto.MetricFamily, es *encState, genLabel, typeLa
 	fr.mf, fr.sh = mf, nil
 	fr.cached = model.LegacyValidation.IsValidMetricName(mf.GetName()) && handledType(mf.GetType())
 	fr.extra, fr.genAt = familyExtra(es, mf.GetType(), genLabel, typeLabel)
-	fr.rows, fr.nums = fr.rows[:0], fr.nums[:0]
+	fr.rows, fr.nums, fr.text = fr.rows[:0], fr.nums[:0], fr.text[:0]
 }
 
 // add keeps what the family's encoding needs of m, an instance whose entry is
@@ -182,14 +190,14 @@ func (fr *familyRows) add(m *dto.Metric, en *entry, gen int64, es *encState) {
 			fr.cached = false
 		}
 	}
-	if fr.cached && (en.rendered == "" || int64(en.renderedGen) != gen) {
+	if fr.cached {
 		if fr.genAt >= 0 {
 			fr.extra[fr.genAt].value = strconv.FormatInt(gen, 10)
 		}
-		rendered, ok := buildLabels(es.buf[:0], m, fr.extra)
+		text, ok := buildLabels(fr.text, m, fr.extra)
 		if ok {
-			es.buf = rendered // keep the grown scratch
-			en.rendered, en.renderedGen = es.share(rendered), uint32(gen)
+			row.text, row.textLen = int32(len(fr.text)), int32(len(text)-len(fr.text))
+			fr.text = text
 		} else {
 			fr.cached = false
 		}
@@ -208,7 +216,7 @@ func (fr *familyRows) encode(w *bufio.Writer, enc expfmt.Encoder, es *encState, 
 	if fr.cached {
 		writeFamilyHeader(w, fr.mf)
 		for i := range fr.rows {
-			if err := writeRow(w, fr.sh, &fr.rows[i], fr.nums, es); err != nil {
+			if err := writeRow(w, fr.sh, &fr.rows[i], fr.nums, fr.text, es); err != nil {
 				return err
 			}
 		}
@@ -231,7 +239,7 @@ func (fr *familyRows) encode(w *bufio.Writer, enc expfmt.Encoder, es *encState, 
 // truncated: a family written once and not again would keep them alive.
 func (fr *familyRows) reset() {
 	clear(fr.rows)
-	fr.rows, fr.nums, fr.mf, fr.sh = fr.rows[:0], fr.nums[:0], nil, nil
+	fr.rows, fr.nums, fr.text, fr.mf, fr.sh = fr.rows[:0], fr.nums[:0], fr.text[:0], nil, nil
 }
 
 // emitFamily writes, decides and encodes the instances collected for one family.
@@ -332,20 +340,20 @@ func familyExtra(es *encState, t dto.MetricType, genLabel, typeLabel string) ([]
 }
 
 // writeRow writes one instance on the cached path, from the values kept for it.
-func writeRow(w *bufio.Writer, sh *familyShape, r *frow, nums []float64, es *encState) error {
-	en := r.en
+func writeRow(w *bufio.Writer, sh *familyShape, r *frow, nums []float64, text []byte, es *encState) error {
+	labels := text[r.text : r.text+r.textLen]
 	plain := closeBrace
-	if len(en.rendered) == 0 {
+	if len(labels) == 0 {
 		plain = plain[1:] // no labels, so no braces to close
 	}
 	line := func(name, tail []byte, v float64) error {
 		if _, err := w.Write(name); err != nil {
 			return err
 		}
-		if _, err := w.WriteString(en.rendered); err != nil {
+		if _, err := w.Write(labels); err != nil {
 			return err
 		}
-		if len(en.rendered) == 0 && len(tail) > 0 && tail[0] == ',' {
+		if len(labels) == 0 && len(tail) > 0 && tail[0] == ',' {
 			if err := w.WriteByte('{'); err != nil {
 				return err
 			}

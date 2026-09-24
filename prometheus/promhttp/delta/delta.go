@@ -302,11 +302,6 @@ type entry struct {
 	// configurations never set.
 	del *deleteKey
 
-	// The rendered labels of this series, without the closing brace, plus the
-	// generation they were rendered under. Shared with every other entry of the
-	// same instance, see encState.share.
-	rendered    string
-	renderedGen uint32 // Unix seconds, as born
 	// What only some configurations need, allocated when one of them first
 	// does. Stamping the generation on the dto is the Gather path only -- the
 	// cached encoder writes it into the label string it keeps -- and the bases

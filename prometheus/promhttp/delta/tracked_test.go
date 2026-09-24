@@ -749,12 +749,12 @@ func TestScrapeScratchHoldsNothingAfterTheScrape(t *testing.T) {
 }
 
 // There is one entry per instance, millions of them, and the allocator rounds
-// each up to its size class: a field that takes the entry past 112 bytes costs
+// each up to its size class: a field that takes the entry past 96 bytes costs
 // 16 on every instance, not the field's own width. Growing it should be a
 // decision, not a side effect.
 func TestEntryStaysInItsSizeClass(t *testing.T) {
-	if n := unsafe.Sizeof(entry{}); n > 112 {
-		t.Errorf("entry is %d bytes, past the 112-byte size class", n)
+	if n := unsafe.Sizeof(entry{}); n > 96 {
+		t.Errorf("entry is %d bytes, past the 96-byte size class", n)
 	}
 }
 

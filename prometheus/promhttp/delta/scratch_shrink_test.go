@@ -14,19 +14,9 @@
 package delta
 
 import (
-	"reflect"
 	"strconv"
 	"testing"
 )
-
-// internPtr identifies the label table itself. A Go map does not expose its
-// capacity, and clearing one leaves len at zero either way, so the only way to
-// see whether the buckets were given back is whether the map was replaced.
-func internPtr(e *TrackedExposer) uintptr {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return reflect.ValueOf(e.enc.intern).Pointer()
-}
 
 // exposerCapacity is what the per-scrape scratch is holding room for. These are
 // all sized by the first scrape after start-up -- every instance is new then,
@@ -35,7 +25,7 @@ func internPtr(e *TrackedExposer) uintptr {
 func exposerCapacity(e *TrackedExposer) int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	total := cap(e.taken) + cap(e.fam.rows) + cap(e.fam.nums)
+	total := cap(e.taken) + cap(e.fam.rows) + cap(e.fam.nums) + cap(e.fam.text)
 	for _, s := range e.slots {
 		total += cap(s.picks)
 	}
@@ -51,7 +41,6 @@ func TestScrapeScratchFallsBackAfterMassDeletion(t *testing.T) {
 		f.h.WithLabelValues("k" + strconv.Itoa(i)).Observe(1)
 	}
 	f.scrape(t, false)
-	beforeIntern := internPtr(f.exp)
 
 	for range 30 {
 		f.c.WithLabelValues("k0").Inc()
@@ -59,10 +48,6 @@ func TestScrapeScratchFallsBackAfterMassDeletion(t *testing.T) {
 	}
 	if got := f.exp.Tracked(); got == 0 || got > 3 {
 		t.Fatalf("%d instances tracked, want the handful still being written", got)
-	}
-
-	if internPtr(f.exp) == beforeIntern {
-		t.Error("the label table was cleared but not replaced, so it still holds buckets for every instance that is gone")
 	}
 
 	f.c.WithLabelValues("k0").Add(2)
@@ -91,45 +76,5 @@ func TestScrapeScratchIsReleasedAfterEveryScrape(t *testing.T) {
 		if got := exposerCapacity(f.exp); got != 0 {
 			t.Errorf("round %d: the scrape scratch still holds room for %d after the scrape", round, got)
 		}
-	}
-}
-
-// The first version of these passed a test that only asked
-// whether the map object had been replaced. It had -- with one sized from the
-// decayed mark, so the replacement was larger than what it replaced, and the
-// mark was then set low enough that it never fired again. What has to be
-// asserted is that the thing shrinks and keeps shrinking.
-
-// After a rebuild the mark has to sit at what is actually there. A Go map does
-// not expose its capacity, so the size the replacement is made with can only be
-// seen by measuring -- sizing it from the mark rather than from what is left
-// rebuilds the table at the size it was meant to give back, which showed up as
-// the label table not falling in a heap profile rather than as a failing test.
-// What is assertable is the bookkeeping the sizing reads.
-func TestRebuiltTableMarkFollowsWhatIsLeft(t *testing.T) {
-	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1})
-
-	const n = minShrink * 8
-	for i := range n {
-		f.c.WithLabelValues("k" + strconv.Itoa(i)).Inc()
-	}
-	f.scrape(t, false)
-
-	f.exp.mu.Lock()
-	peak := f.exp.enc.internPeak
-	f.exp.mu.Unlock()
-	if peak < n {
-		t.Fatalf("the mark is %d after interning at least %d", peak, n)
-	}
-
-	for range 30 {
-		f.c.WithLabelValues("k0").Inc()
-		f.scrape(t, false)
-	}
-	f.exp.mu.Lock()
-	peak, held := f.exp.enc.internPeak, len(f.exp.enc.intern)
-	f.exp.mu.Unlock()
-	if peak > n/2 {
-		t.Errorf("the mark is still %d after the table drained to %d entries", peak, held)
 	}
 }

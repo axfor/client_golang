@@ -24,17 +24,17 @@ import (
 
 // Writing the text exposition format with the per-series part cached.
 //
-// expfmt renders the metric name and every label pair of every sample on every
-// scrape, validating the names and escaping the values each time, which for a
-// process whose series are stable is the largest single cost of a scrape. None
-// of it changes between scrapes, so each series keeps its rendered labels and a
-// scrape composes a line from those plus pieces the family shares.
+// expfmt renders the metric name and every label pair of every sample,
+// validating the names and escaping the values each time: a histogram's labels
+// once per bucket, plus _sum and _count. Here a series' labels are rendered once
+// per scrape and every line of it is composed from that plus pieces the family
+// shares -- the metric name with each suffix, and the le of each bucket, which
+// the family holds once.
 //
-// A series keeps one label string, not one prefix per line: a histogram writes a
-// line per bucket plus _sum and _count, and holding a full prefix for each cost
-// more memory than the whole rest of the exposer. What varies between those
-// lines is the metric name and the le, which every series of a family has in
-// common and which the family therefore holds once.
+// The rendered labels are not kept between scrapes. They were, on each entry and
+// shared between the families of one instance, and that was over 50 bytes of
+// every instance held for its whole life to spare rendering again the part of
+// them that changes in a scrape.
 //
 // Anything this encoder does not handle falls back to expfmt, so the output is
 // the same either way: summaries, native histograms, samples carrying their own
@@ -45,61 +45,12 @@ import (
 type encState struct {
 	shapes map[string]*familyShape
 
-	// Every family an instance appears in renders the same labels: a key with 36
-	// metrics holds 36 copies of one string. Labels built during a scrape are
-	// shared through this table, which is cleared at the end of it -- an
-	// instance's entries are all created by the first write that touches it, so
-	// they are built together and nothing has to be swept later.
-	intern map[string]string
-
-	buf   []byte        // scratch for building one label string
 	num   []byte        // scratch for formatting one value
 	extra [2]extraLabel // the generation and the type, reused per family
-
-	// Recent high-water mark of what intern held in one scrape. Clearing a map
-	// releases the entries but keeps the buckets, and this one is sized by the
-	// first scrape after start-up, when every instance is new and so is written.
-	internPeak int
 }
 
 func newEncState() *encState {
-	return &encState{shapes: map[string]*familyShape{}, intern: map[string]string{}}
-}
-
-// share returns the one copy of b this scrape keeps.
-func (es *encState) share(b []byte) string {
-	if s, ok := es.intern[string(b)]; ok {
-		return s
-	}
-	s := string(b)
-	es.intern[s] = s
-	return s
-}
-
-// resetIntern empties the label table for the next scrape, and gives its
-// buckets back once a scrape uses far fewer than the largest one did. A Go map
-// never returns them on its own: after idle cleanup the table is still sized
-// for every instance the process had.
-func (es *encState) resetIntern() {
-	n := len(es.intern)
-	if n > es.internPeak {
-		es.internPeak = n
-		clear(es.intern)
-		return
-	}
-	// The mark is the largest this table has held since it was last built, and
-	// it does not decay: a table that fills gradually and then drains gradually
-	// still has to be given back, and a mark that decays as fast as the drain
-	// is re-pinned every scrape and never gets two times above it.
-	//
-	// The replacement is sized from what is there now, not from the mark. Sizing
-	// it from the mark rebuilds the table at the size it is being replaced for.
-	if es.internPeak >= minShrink && n < es.internPeak/2 {
-		es.intern = make(map[string]string, n+n/4+1)
-		es.internPeak = n
-		return
-	}
-	clear(es.intern)
+	return &encState{shapes: map[string]*familyShape{}}
 }
 
 // familyShape is what every series of a family writes the same way: the metric
