@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/metrics"
 	"runtime/pprof"
 	"slices"
 	"strconv"
@@ -40,6 +41,8 @@ func TestScrapeCostAtScale(t *testing.T) {
 	const measured = 10
 	var took []time.Duration
 	var allocs, wire int
+	var allocBytes uint64
+	var peakInuse uint64 // highest HeapInuse seen while a scrape ran, sampled every millisecond
 	prefix := os.Getenv("MEMTEST_CPUPROFILE")
 	for n := range measured {
 		s.write(every, round%every)
@@ -58,10 +61,13 @@ func TestScrapeCostAtScale(t *testing.T) {
 		}
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
+		stop := watchHeap()
 		start := time.Now()
 		wire = s.scrape()
 		took = append(took, time.Since(start))
+		peakInuse = max(peakInuse, stop())
 		runtime.ReadMemStats(&after)
+		allocBytes += after.TotalAlloc - before.TotalAlloc
 		if f != nil {
 			pprof.StopCPUProfile()
 			f.Close()
@@ -69,8 +75,43 @@ func TestScrapeCostAtScale(t *testing.T) {
 		allocs += int(after.Mallocs - before.Mallocs)
 	}
 	slices.Sort(took)
+	var idle runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&idle)
 	t.Logf("%d instances, 1/%d changing per scrape: median %v (min %v, max %v), %d allocs and %.1f MB on the wire per scrape",
 		s.instances(), every, took[measured/2].Round(time.Millisecond), took[0].Round(time.Millisecond),
 		took[measured-1].Round(time.Millisecond), allocs/measured, float64(wire)/1e6)
+	t.Logf("allocated %.0f MiB per scrape; heap in use peaked at %.0f MiB during a scrape against %.0f MiB live between them",
+		float64(allocBytes)/measured/(1<<20), float64(peakInuse)/(1<<20), float64(idle.HeapInuse)/(1<<20))
 	runtime.KeepAlive(s)
+}
+
+// watchHeap samples the heap in use every millisecond until the returned stop
+// is called, and stop returns the highest value seen. A scrape's transient
+// allocation is what decides how far past the live heap a process goes during
+// it, which the live heap after a collection does not show. runtime/metrics
+// rather than ReadMemStats, which stops the world on every call.
+func watchHeap() (stop func() uint64) {
+	var high uint64
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		samples := []metrics.Sample{
+			{Name: "/memory/classes/heap/objects:bytes"},
+			{Name: "/memory/classes/heap/unused:bytes"},
+		}
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			metrics.Read(samples)
+			high = max(high, samples[0].Value.Uint64()+samples[1].Value.Uint64())
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+	return func() uint64 { close(done); <-finished; return high }
 }
