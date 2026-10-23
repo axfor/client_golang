@@ -40,27 +40,51 @@ const dirtyShardCount = 256
 
 // dirtyRef is embedded in every metric that can be tracked. It is one pointer
 // wide and stays nil unless the metric was created while a ChangeTracker was set.
+//
+// The pointer is atomic because a write reads it while the instance may be
+// deleted from its Vec, which clears it. On amd64 the load is a plain move and
+// on arm64 a load-acquire, next to the atomic add every write already does.
 type dirtyRef struct {
-	d *dirtyState
+	d atomic.Pointer[dirtyState]
 }
 
 // mark enlists the metric in the dirty list. Keep this small enough to inline:
 // it sits on the write path of every counter, gauge and histogram.
 func (r *dirtyRef) mark() {
-	if d := r.d; d != nil {
+	if d := r.d.Load(); d != nil {
 		d.mark()
 	}
 }
 
 // dirtyState is allocated once per tracked instance.
+//
+// owner, home and hash are set when the instance is enlisted and never change:
+// a deleted instance is marked dead instead of having them cleared, because a
+// write, Take and RangeBucket may all be reading them at that moment. The fields
+// stay at 64 bytes, dead taking the padding after epoch.
 type dirtyState struct {
 	epoch atomic.Uint32 // shard epoch as of the last time this entered the dirty list
+	dead  atomic.Bool   // deleted from its Vec; owner is no longer handed out
 	shard *dirtyShard
 	owner Metric
 	home  *metricMap     // the Vec this instance belongs to, so it can be dropped
 	hash  uint64         // its bucket in home
-	idx   int            // index into the shard's all slice, for removal
+	idx   int            // index into the shard's all slice, for removal; under shard.allMu
 	slot  unsafe.Pointer // the consumer's, see TrackerSlot
+}
+
+// live returns the instance, or nil once it has been deleted from its Vec.
+func (d *dirtyState) live() Metric {
+	if d.dead.Load() {
+		return nil
+	}
+	return d.owner
+}
+
+// written reports whether the instance has been written since the tracker last
+// handed it out: it is waiting in the dirty list of its shard.
+func (d *dirtyState) written() bool {
+	return d.epoch.Load() == d.shard.epoch.Load()
 }
 
 // mark enlists d unless it is already waiting to be taken. An equal epoch means
@@ -175,7 +199,7 @@ func trackMetric(home *metricMap, m Metric, hash uint64) {
 	}
 	s := &t.shards[hash%dirtyShardCount]
 	d := &dirtyState{shard: s, owner: m, home: home, hash: hash}
-	ref.d = d
+	ref.d.Store(d)
 
 	s.allMu.Lock()
 	d.idx = len(s.all)
@@ -188,18 +212,18 @@ func trackMetric(home *metricMap, m Metric, hash uint64) {
 // untrackMetric drops an instance a Vec has just deleted.
 //
 // A write racing with the delete can still enlist the old dirtyState; Take skips
-// it because owner is nil by then. The shard pointer is deliberately left in
-// place so such an in-flight mark cannot dereference nil.
+// it because it is dead by then. Nothing is cleared, so such an in-flight mark,
+// and a Take or RangeBucket holding it, read what they read before.
 func untrackMetric(m Metric) {
 	ref, ok := dirtyRefOf(m)
 	if !ok {
 		return
 	}
-	d := ref.d
+	d := ref.d.Swap(nil)
 	if d == nil {
 		return
 	}
-	ref.d = nil
+	d.dead.Store(true)
 	s := d.shard
 
 	s.allMu.Lock()
@@ -216,10 +240,8 @@ func untrackMetric(m Metric) {
 			s.all = shrunk(s.all, s.allPeak)
 		}
 	}
-	s.allMu.Unlock()
-	d.owner = nil
-	d.home = nil
 	d.idx = -1
+	s.allMu.Unlock()
 }
 
 // DeleteTracked removes a tracked instance from the Vec that created it, which
@@ -234,15 +256,51 @@ func untrackMetric(m Metric) {
 // That is how Vec.Delete behaves as well; only delete what has been idle long
 // enough for this to be vanishingly unlikely.
 func DeleteTracked(m Metric) bool {
+	d := liveDirtyState(m)
+	if d == nil {
+		return false
+	}
+	return d.home.deleteMetric(d.hash, m, nil)
+}
+
+// DeleteTrackedIfUnwritten is DeleteTracked for an instance the consumer found
+// idle: it removes the instance only if it has not been written since the
+// tracker last handed it out, checked under the lock of its Vec.
+//
+// A consumer decides an instance is idle from what it has seen, and that goes
+// stale while it works: a request that looks the key up in the meantime gets this
+// instance, still in the Vec, and its write would be lost with it. The check
+// covers every write that has enlisted the instance by the time the Vec is
+// locked, and no new lookup can find the instance while it is. What is left is a
+// write between its value update and its enlisting, and one by a caller that
+// looked the instance up before the lock and writes after it, as with any
+// Vec.Delete.
+func DeleteTrackedIfUnwritten(m Metric) bool {
+	d := liveDirtyState(m)
+	if d == nil {
+		return false
+	}
+	return d.home.deleteMetric(d.hash, m, func() bool { return !d.written() })
+}
+
+// TrackedWritten reports whether a tracked instance has been written since the
+// tracker last handed it out. A consumer deleting instances through a callback
+// of its own, rather than DeleteTrackedIfUnwritten, checks this first.
+func TrackedWritten(m Metric) bool {
+	d := liveDirtyState(m)
+	return d != nil && d.written()
+}
+
+func liveDirtyState(m Metric) *dirtyState {
 	ref, ok := dirtyRefOf(m)
 	if !ok {
-		return false
+		return nil
 	}
-	d := ref.d
-	if d == nil || d.home == nil {
-		return false
+	d := ref.d.Load()
+	if d == nil || d.dead.Load() {
+		return nil
 	}
-	return d.home.deleteMetric(d.hash, m)
+	return d
 }
 
 // TrackerSlot returns one word for the tracker's consumer to keep its own state
@@ -257,11 +315,7 @@ func DeleteTracked(m Metric) bool {
 // starts nil and is read and written only by the single consumer the tracker
 // already assumes.
 func TrackerSlot(m Metric) *unsafe.Pointer {
-	ref, ok := dirtyRefOf(m)
-	if !ok {
-		return nil
-	}
-	d := ref.d
+	d := liveDirtyState(m)
 	if d == nil {
 		return nil
 	}
@@ -293,7 +347,7 @@ func (t *ChangeTracker) Take(fn func(Metric)) {
 		s.mu.Unlock()
 
 		for _, d := range taken {
-			if m := d.owner; m != nil {
+			if m := d.live(); m != nil {
 				fn(m)
 			}
 		}
@@ -334,7 +388,7 @@ func (t *ChangeTracker) RangeBucket(bucket, buckets int, fn func(Metric)) {
 		s := &t.shards[i]
 		s.allMu.RLock()
 		for _, d := range s.all {
-			if m := d.owner; m != nil {
+			if m := d.live(); m != nil {
 				fn(m)
 			}
 		}

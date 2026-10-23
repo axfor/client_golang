@@ -104,6 +104,38 @@ func (rs *response) close(err error, r *http.Request) (error, bool) {
 	return err, err == nil
 }
 
+// discard gives each layer back to its pool without finishing the response: no
+// buffered bytes are written and no compressed stream is closed, so what the
+// scraper got so far does not end like a whole response.
+func (rs *response) discard() {
+	rs.w.Reset(nil)
+	bufioPool.Put(rs.w)
+	if rs.zw != nil {
+		rs.zw.Reset(nil)
+		zstdPool.Put(rs.zw)
+	}
+	if rs.gz != nil {
+		rs.gz.Reset(nil)
+		gzipPool.Put(rs.gz)
+	}
+}
+
+// abort ends a response that broke off midway so that the scraper sees it fail
+// rather than end: the connection is closed under it, or, where it cannot be
+// taken over, as with HTTP/2, the handler panics with http.ErrAbortHandler,
+// which the server answers by resetting the stream without logging. A scraper
+// reading the whole response before parsing it, as vmagent does, then throws it
+// away, and the increments it carried are reported again in the next round.
+func abort(w http.ResponseWriter) {
+	if hj, ok := w.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			_ = conn.Close()
+			return
+		}
+	}
+	panic(http.ErrAbortHandler)
+}
+
 // negotiateEncoding parses Accept-Encoding, matching whole tokens and treating
 // q=0 as a refusal, with zstd winning ties.
 //

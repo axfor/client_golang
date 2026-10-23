@@ -53,6 +53,8 @@ type TrackedExposer struct {
 
 	mu    sync.Mutex
 	round uint64
+	ack   ackState
+	held  []pendingCommit // the round awaiting acknowledgement, see ack.go
 	// Each instance's entry is kept in the instance's own tracker slot, see
 	// entryOf, rather than in a map from instance to entry: at two million
 	// instances such a map is about 40 bytes an instance on top of the entries.
@@ -86,6 +88,7 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 	return &TrackedExposer{
 		opts:    opts,
 		tracker: t,
+		ack:     newAckState(),
 		scratch: map[string]*dto.Metric{},
 		byName:  map[string]int{},
 		enc:     newEncState(),
@@ -135,6 +138,21 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	defer e.mu.Unlock()
 
 	st := ScrapeStats{}
+	// The round the scraper was last given is settled before anything is taken,
+	// so that one rolled back is in the dirty list this round takes.
+	if held, commit := e.ack.settle(r); held {
+		if commit {
+			e.commit(e.held)
+			st.Settled = SettledCommitted
+		} else {
+			for _, pc := range e.held {
+				prometheus.MarkChanged(pc.m)
+			}
+			st.Settled = SettledRolledBack
+		}
+		e.held = nil
+	}
+
 	e.round++
 	st.Round = e.round
 	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
@@ -187,18 +205,42 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	}
 
 	// Second pass: write, decide and encode one family at a time.
+	round := e.ack.roundID(e.round)
+	w.Header().Set(RoundHeader, round)
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	var pending []pendingCommit
 	for i := 0; i < e.nslots && st.Err == nil; i++ {
 		st.Err = e.emitFamily(&e.slots[i], rs.w, enc, &st, &pending)
 	}
-	st.Err, st.Delivered = rs.close(st.Err, r)
+	if st.Err != nil {
+		// The response broke off midway. Finishing it would hand the scraper a
+		// well-formed response with the rest missing, which it would take in
+		// part while everything here is reported again; so it is not finished,
+		// and the connection is aborted below, once the state here is in order.
+		rs.discard()
+		st.Aborted = true
+	} else {
+		st.Err, st.Delivered = rs.close(nil, r)
+	}
 
-	if st.Delivered {
+	switch {
+	case peeks(r):
+		// Looked at, not processed: everything taken is reported again, and
+		// nothing is dropped on the strength of it.
+		for _, m := range e.taken {
+			prometheus.MarkChanged(m)
+		}
+		idle = nil
+	case st.Delivered && acknowledges(r):
+		// Committed once the scraper says it processed this round, see ack.go.
+		e.held = pending
+		e.ack.held = round
+		e.rb.delivered()
+	case st.Delivered:
 		e.commit(pending)
 		e.rb.delivered()
-	} else {
+	default:
 		// undelivered: put them back so the next scrape reports them again,
 		// together with whatever accrues in the meantime
 		for _, m := range e.taken {
@@ -221,6 +263,9 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	e.fam.rows, e.fam.nums, e.fam.text = nil, nil, nil
 	e.taken = nil
 	st.Deleted = e.drop(idle)
+	if st.Aborted {
+		abort(w)
+	}
 	return st
 }
 
@@ -241,25 +286,47 @@ func (e *TrackedExposer) commit(pending []pendingCommit) {
 }
 
 // drop removes idle instances from their Vec, through Options.Delete when one is
-// set and through prometheus.DeleteTracked otherwise, and lets go of their
-// entries.
+// set and through prometheus.DeleteTrackedIfUnwritten otherwise, and lets go of
+// their entries.
+//
+// They were found idle before the response was written, and a request may have
+// written to one since: it looked the key up while the instance was still in
+// its Vec, and with the instance would go its write. So an instance is dropped
+// only if it is still idle now and has not been written since it was taken,
+// which DeleteTrackedIfUnwritten checks under the lock of its Vec. One written to
+// stays, and the next scrape reports it.
 func (e *TrackedExposer) drop(idle []idleEntry) int {
+	n := 0
 	for _, x := range idle {
+		if e.round-x.en.changed <= uint64(e.opts.IdleScrapes) || !deletable(x.en) {
+			continue // written before this round took it, and reported in it
+		}
+		if prometheus.TrackerSlot(x.m) == nil {
+			// Deleted from its Vec by other means since it was found idle; its
+			// state went with it.
+			e.live--
+			n++
+			continue
+		}
 		if e.opts.Delete != nil {
+			if prometheus.TrackedWritten(x.m) {
+				continue
+			}
 			family, labels := x.m.Desc().Name(), prometheus.Labels(nil)
 			if d := x.en.del; d != nil {
 				family, labels = d.family, d.labels
 			}
 			e.opts.Delete(family, labels)
-		} else {
-			prometheus.DeleteTracked(x.m)
+		} else if !prometheus.DeleteTrackedIfUnwritten(x.m) {
+			continue
 		}
 		// Cleared whichever way it went: a Delete that left the child in place
 		// must see it start over as new, as it did when the entry left a map.
 		*x.slot = nil
 		e.live--
+		n++
 	}
-	return len(idle)
+	return n
 }
 
 func metricType(m *dto.Metric) *dto.MetricType {

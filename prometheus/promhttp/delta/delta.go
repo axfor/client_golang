@@ -21,7 +21,8 @@
 //	             when DisableHeartbeat is set.
 //	delta        Counters and histograms report what accrued since the last
 //	             delivered scrape. A scrape that does not arrive is rolled into
-//	             the next one. On the collector side, vmagent's sum_samples_total
+//	             the next one, and so is one the scraper says it did not process,
+//	             see ack.go. On the collector side, vmagent's sum_samples_total
 //	             adds the values back up per series: it does not have to remember
 //	             a previous value per instance, so its memory does not grow with
 //	             the number of instances and a restart does not have to drop the
@@ -164,12 +165,16 @@ type Options struct {
 	// A series that reappears starts from zero again, which is exactly right in
 	// delta mode.
 	//
-	// Note that deletion is not coordinated with writes: if a request is holding
-	// the old child while Vec.Delete removes it, that write is lost. This is
-	// client_golang's own semantics and not specific to this package. A generous
-	// threshold (30 at a 60s interval, i.e. half an hour without traffic) makes
-	// it very unlikely; leave the option off to rule it out entirely and keep
-	// every instance resident.
+	// On the change-tracking path an instance is deleted only if it has not
+	// been written since the scrape took it, checked under the lock of its Vec,
+	// so a request that looks the key up while the scrape is under way keeps its
+	// write. What is left is client_golang's own semantics: a caller holding a
+	// child it looked up earlier and writing to it after it was deleted loses
+	// that write -- never keep children of a Vec this deletes from. The Gather
+	// path cannot tell what was written since it gathered, and deletes right
+	// after gathering to keep that window short. A generous threshold (30 at a
+	// 60s interval, i.e. half an hour without traffic) makes both very unlikely;
+	// leave the option off to rule them out and keep every instance resident.
 	IdleScrapes int
 
 	// Delete is called when a series is dropped as idle, to remove the matching
@@ -267,8 +272,23 @@ type ScrapeStats struct {
 	Deleted   int    // idle series dropped this scrape
 	Rebased   bool   // the gap since the last delivery exceeded RebaseAfterGap, so the generation moved
 	Delivered bool   // response fully written and the request not cancelled
-	Err       error
+	// Aborted: the response broke off midway, so the connection was aborted
+	// rather than the response ended, see abort. Nothing of it is committed.
+	Aborted bool
+	// Settled is what became of the previous round, held for the scraper to
+	// acknowledge, when this request came in; see ack.go.
+	Settled Settlement
+	Err     error
 }
+
+// Settlement is what became of a round held for acknowledgement.
+type Settlement int
+
+const (
+	SettledNone       Settlement = iota // no round was held
+	SettledCommitted                    // acknowledged, or the request did not say: committed
+	SettledRolledBack                   // the scraper did not process it: reported again
+)
 
 // Exposer holds the last delivered values and the idle counters.
 type Exposer struct {
@@ -279,6 +299,8 @@ type Exposer struct {
 
 	mu     sync.Mutex
 	round  uint64
+	ack    ackState
+	held   []pendingCommit // the round awaiting acknowledgement, see ack.go
 	state  map[string]*entry
 	keyBuf []byte // reused series key; m[string(buf)] looks up without allocating
 }
@@ -338,7 +360,7 @@ func (en *entry) ext() *entryExtra {
 // New returns an Exposer reading from g.
 func New(g prometheus.Gatherer, opts Options) *Exposer {
 	opts = check(opts)
-	return &Exposer{g: g, opts: opts, state: map[string]*entry{}}
+	return &Exposer{g: g, opts: opts, state: map[string]*entry{}, ack: newAckState()}
 }
 
 // check fills in the defaults and rejects combinations that would silently
@@ -376,6 +398,18 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 	defer e.mu.Unlock()
 
 	st := ScrapeStats{}
+	// A round rolled back needs nothing more: its values were never committed,
+	// so this round, read against the same ones, reports them again.
+	if held, commit := e.ack.settle(r); held {
+		if commit {
+			e.commit(e.held)
+			st.Settled = SettledCommitted
+		} else {
+			st.Settled = SettledRolledBack
+		}
+		e.held = nil
+	}
+
 	mfs, err := e.g.Gather()
 	if err != nil {
 		st.Err = err
@@ -396,22 +430,55 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 	for _, mf := range out {
 		st.Samples += len(mf.Metric)
 	}
+	// Idle series are dropped now, right after they were read, rather than once
+	// the response is out: a write in between lands on an instance about to be
+	// deleted through Options.Delete, and is lost with it. This path cannot tell
+	// whether one was written since it was read, as change tracking can, so the
+	// window is narrowed to the time since Gather, not closed. A peek drops
+	// nothing.
+	if !peeks(r) {
+		st.Deleted = e.sweep()
+	}
 
+	round := e.ack.roundID(e.round)
+	w.Header().Set(RoundHeader, round)
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
+	gatherErr := st.Err
 	for _, mf := range out {
 		if err := enc.Encode(mf); err != nil {
 			st.Err = err
+			st.Aborted = true
 			break
 		}
 	}
-	st.Err, st.Delivered = rs.close(st.Err, r)
+	if st.Aborted {
+		rs.discard()
+		abort(w)
+		return st
+	}
+	// A response written in full despite a Gather error carries what could be
+	// gathered and is delivered for what it carries. Counting it undelivered, as
+	// this did, left its values uncommitted, and the next scrape reported them
+	// again on top of what this one did.
+	cerr, delivered := rs.close(nil, r)
+	st.Delivered = delivered
+	if cerr != nil || gatherErr == nil {
+		st.Err = cerr
+	}
 
-	if st.Delivered {
+	switch {
+	case peeks(r):
+		// Looked at, not processed: nothing is committed, and the next round,
+		// read against the same values, reports it all again.
+	case st.Delivered && acknowledges(r):
+		e.held = pending
+		e.ack.held = round
+		e.rb.delivered()
+	case st.Delivered:
 		e.commit(pending)
 		e.rb.delivered()
 	}
-	st.Deleted = e.sweep()
 	return st
 }
 
@@ -456,6 +523,7 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 
 type pendingCommit struct {
 	en      *entry
+	m       prometheus.Metric // the instance, on the change-tracking path: re-marked on a roll-back
 	value   float64
 	sum     float64
 	count   uint64

@@ -428,18 +428,22 @@ func (m *metricMap) deleteByHashWithLabelValues(
 
 // deleteMetric removes one specific metric from the hash bucket h, identified by
 // identity rather than by its label values. Change tracking uses it to drop an
-// instance it holds a reference to.
-func (m *metricMap) deleteMetric(h uint64, metric Metric) bool {
+// instance it holds a reference to. A non-nil ok is asked under the lock, which
+// keeps lookups out, and the metric stays when it answers false.
+func (m *metricMap) deleteMetric(h uint64, metric Metric, ok func() bool) bool {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	metrics, ok := m.metrics[h]
-	if !ok {
+	metrics, found := m.metrics[h]
+	if !found {
 		return false
 	}
 	for i := range metrics {
 		if metrics[i].metric != metric {
 			continue
+		}
+		if ok != nil && !ok() {
+			return false
 		}
 		untrackMetric(metric)
 		if len(metrics) > 1 {

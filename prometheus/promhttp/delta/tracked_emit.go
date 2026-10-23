@@ -289,6 +289,7 @@ func (e *TrackedExposer) emitFamily(s *familySlot, w *bufio.Writer, enc expfmt.E
 		}
 		emit, _, pc := e.decide(fr.mf, m, en)
 		if pc != nil {
+			pc.m = p.m
 			*pending = append(*pending, *pc)
 		}
 		if !emit && p.reason == pickChanged {
