@@ -281,6 +281,19 @@ type Registry struct {
 	pedanticChecksEnabled bool
 }
 
+// Describes reports whether a collector registered with r describes d. The
+// change-tracking path of promhttp/delta uses it to keep to the metrics of one
+// registry: change tracking itself sees every metric of the process.
+func (r *Registry) Describes(d *Desc) bool {
+	if d == nil {
+		return false
+	}
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+	_, ok := r.descIDs[d.id]
+	return ok
+}
+
 // Register implements Registerer.
 func (r *Registry) Register(c Collector) error {
 	var (

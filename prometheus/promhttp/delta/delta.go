@@ -251,6 +251,15 @@ type Options struct {
 	// before a scrape is handed on, so the label would be gone before the
 	// aggregator saw it, and nothing would fail.
 	TypeLabel string
+	// Scope limits the change-tracking path to the metrics registered with it.
+	// Change tracking sees every metric of the process, so without it the
+	// exposition carries, and idle cleanup deletes from their Vecs, the metrics
+	// of every other registry too: a framework counter quiet for IdleScrapes
+	// scrapes would vanish from its own endpoint, and a child some code keeps
+	// would lose every write after that. Set it to the registry the usage
+	// metrics are registered with. The Gather path reads its Gatherer only and
+	// ignores it.
+	Scope *prometheus.Registry
 	// Gatherer selects the slower path that reads through a Gatherer instead of
 	// change tracking. Enable uses it when change tracking cannot be turned on
 	// early enough, for instance when metrics already exist.

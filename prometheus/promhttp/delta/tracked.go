@@ -55,6 +55,9 @@ type TrackedExposer struct {
 	round uint64
 	ack   ackState
 	held  []pendingCommit // the round awaiting acknowledgement, see ack.go
+	// inScope caches Options.Scope's answer per Desc for one scrape; cleared at
+	// the start of each, so registering or unregistering takes effect then.
+	inScope map[*prometheus.Desc]bool
 	// Each instance's entry is kept in the instance's own tracker slot, see
 	// entryOf, rather than in a map from instance to entry: at two million
 	// instances such a map is about 40 bytes an instance on top of the entries.
@@ -89,6 +92,7 @@ func NewTracked(t *prometheus.ChangeTracker, opts Options) *TrackedExposer {
 		opts:    opts,
 		tracker: t,
 		ack:     newAckState(),
+		inScope: map[*prometheus.Desc]bool{},
 		scratch: map[string]*dto.Metric{},
 		byName:  map[string]int{},
 		enc:     newEncState(),
@@ -158,6 +162,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
 
 	clear(e.byName)
+	clear(e.inScope)
 	e.nslots = 0
 	e.taken = e.taken[:0]
 	var idle []idleEntry

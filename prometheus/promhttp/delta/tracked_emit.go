@@ -81,11 +81,18 @@ type frow struct {
 
 // pick records m for this scrape, creating its entry if it is new.
 func (e *TrackedExposer) pick(m prometheus.Metric, reason pickReason) {
+	desc := m.Desc()
+	if !e.scoped(desc) {
+		// Another registry's: not reported, and kept out of idle cleanup. Its
+		// write was taken off the dirty list here; the next one puts it back,
+		// and should it be registered with the scope by then, its first report
+		// carries everything since it was created.
+		return
+	}
 	en, slot := entryOf(m)
 	if slot == nil {
 		return // deleted from its Vec since it was taken
 	}
-	desc := m.Desc()
 	fresh := en == nil
 	if fresh {
 		en = &entry{changed: e.round, born: uint32(e.rb.clock().Unix())}
@@ -110,6 +117,19 @@ func (e *TrackedExposer) pick(m prometheus.Metric, reason pickReason) {
 	// Undelivered, every instance taken is put back on the dirty list, whether or
 	// not its write goes through: the tracker has already cleared its flag.
 	e.taken = append(e.taken, m)
+}
+
+// scoped reports whether desc is within Options.Scope, everything when none.
+func (e *TrackedExposer) scoped(desc *prometheus.Desc) bool {
+	if e.opts.Scope == nil {
+		return true
+	}
+	in, ok := e.inScope[desc]
+	if !ok {
+		in = e.opts.Scope.Describes(desc)
+		e.inScope[desc] = in
+	}
+	return in
 }
 
 // familyRows is one family while it is being written: its header, how it will

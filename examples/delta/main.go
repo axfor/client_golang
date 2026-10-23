@@ -122,6 +122,10 @@ func main() {
 	// nothing and would have to be aggregated away again. Setting both panics.
 	opts := delta.Increments()
 	opts.TypeLabel = "_metric_type"
+	// Only the usage registry's metrics: change tracking sees every metric of
+	// the process, and without this the framework ones would be reported here
+	// too and deleted from their Vecs once idle.
+	opts.Scope = usageReg
 
 	usage := delta.NewTracked(trk, opts)
 	cumulative := promhttp.HandlerFor(usageReg, promhttp.HandlerOpts{})

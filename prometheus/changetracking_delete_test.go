@@ -103,3 +103,19 @@ func TestDeleteTrackedIfUnwritten(t *testing.T) {
 		t.Fatal("a deleted instance was handed out")
 	}
 }
+
+// Describes tells the Descs of a registry's collectors from those of others,
+// and follows Unregister.
+func TestRegistryDescribes(t *testing.T) {
+	r := NewRegistry()
+	in := NewCounterVec(CounterOpts{Name: "in_total", Help: "h"}, []string{"k"})
+	out := NewCounterVec(CounterOpts{Name: "out_total", Help: "h"}, []string{"k"})
+	r.MustRegister(in)
+	if !r.Describes(in.WithLabelValues("a").Desc()) || r.Describes(out.WithLabelValues("a").Desc()) || r.Describes(nil) {
+		t.Fatal("Describes does not tell the registered collector from the other")
+	}
+	r.Unregister(in)
+	if r.Describes(in.WithLabelValues("a").Desc()) {
+		t.Fatal("Describes still reports an unregistered collector")
+	}
+}
