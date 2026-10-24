@@ -56,6 +56,11 @@ type pick struct {
 	en     *entry
 	fresh  bool
 	reason pickReason
+	// Its values as the scrape read them at its cut, see
+	// snapshotPicks: TrackedExposer.snap[snap:snap+snapN], snap -1 when none were
+	// read, and then the second pass reads them itself.
+	snap  int32
+	snapN int32
 }
 
 // familySlot is what the first pass collected for one family.
@@ -113,7 +118,7 @@ func (e *TrackedExposer) pick(m prometheus.Metric, reason pickReason) {
 		e.nslots++
 	}
 	s := &e.slots[idx]
-	s.picks = append(s.picks, pick{m: m, en: en, fresh: fresh, reason: reason})
+	s.picks = append(s.picks, pick{m: m, en: en, fresh: fresh, reason: reason, snap: -1})
 	// Undelivered, every instance taken is put back on the dirty list, whether or
 	// not its write goes through: the tracker has already cleared its flag.
 	e.taken = append(e.taken, m)
@@ -277,6 +282,9 @@ func (e *TrackedExposer) emitFamily(s *familySlot, w *bufio.Writer, enc expfmt.E
 		if err := p.m.Write(m); err != nil {
 			continue
 		}
+		if p.snap >= 0 && !applySnapshot(m, e.snap[p.snap:p.snap+p.snapN]) {
+			continue // its shape changed since the snapshot; it goes out next scrape
+		}
 		switch p.reason {
 		case pickHeartbeat:
 			st.Heartbeat++
@@ -319,6 +327,91 @@ func (e *TrackedExposer) emitFamily(s *familySlot, w *bufio.Writer, enc expfmt.E
 	}
 	st.Samples += len(fr.rows)
 	return fr.encode(w, enc, e.enc, e.rb.genOf, e.opts.GenLabel, e.opts.TypeLabel)
+}
+
+// snapshotPicks reads the values of every instance taken. A counter's is its
+// value as of the scrape's cut, see ChangeTracker.Cut and CutValue: the writes
+// made before the cut and none after, so every write to a counter is in the
+// scrape or not as it was made before the cut or after. Other kinds are read as they are now. Only the
+// numbers are kept, see snapValues; everything else, the labels among it, is
+// read again in the second pass, and the numbers put back over what that read
+// finds.
+func (e *TrackedExposer) snapshotPicks() {
+	e.snap = e.snap[:0]
+	for i := 0; i < e.nslots; i++ {
+		s := &e.slots[i]
+		name := s.desc.Name()
+		m := e.scratch[name]
+		if m == nil {
+			m = &dto.Metric{}
+			e.scratch[name] = m
+		}
+		for j := range s.picks {
+			p := &s.picks[j]
+			m.TimestampMs = nil
+			if err := p.m.Write(m); err != nil {
+				continue
+			}
+			if m.Counter != nil {
+				if v, ok := prometheus.CutValue(p.m); ok {
+					m.Counter.Value = proto.Float64(v)
+				}
+			}
+			off := len(e.snap)
+			var ok bool
+			if e.snap, ok = snapValues(e.snap, m); ok {
+				p.snap, p.snapN = int32(off), int32(len(e.snap)-off)
+			} else {
+				e.snap = e.snap[:off]
+			}
+		}
+	}
+}
+
+// snapValues appends the numbers of m that a scrape reports: the value of a
+// counter, gauge or untyped metric, or the sum, count and bucket counts of a
+// classic histogram. Native histograms and summaries are passed through, not
+// differenced, and are not kept: it reports false for them.
+func snapValues(dst []float64, m *dto.Metric) ([]float64, bool) {
+	switch {
+	case m.Counter != nil:
+		return append(dst, m.Counter.GetValue()), true
+	case m.Gauge != nil:
+		return append(dst, m.Gauge.GetValue()), true
+	case m.Untyped != nil:
+		return append(dst, m.Untyped.GetValue()), true
+	case m.Histogram != nil && !isNative(m.Histogram):
+		h := m.Histogram
+		dst = append(dst, h.GetSampleSum(), float64(h.GetSampleCount()))
+		for _, b := range h.Bucket {
+			dst = append(dst, float64(b.GetCumulativeCount()))
+		}
+		return dst, true
+	}
+	return dst, false
+}
+
+// applySnapshot puts the numbers snapValues kept back over m, a read of the same
+// instance taken later. It reports false when they do not fit m, which cannot
+// happen for an instance whose type and buckets are fixed at creation.
+func applySnapshot(m *dto.Metric, v []float64) bool {
+	switch {
+	case m.Counter != nil && len(v) == 1:
+		m.Counter.Value = proto.Float64(v[0])
+	case m.Gauge != nil && len(v) == 1:
+		m.Gauge.Value = proto.Float64(v[0])
+	case m.Untyped != nil && len(v) == 1:
+		m.Untyped.Value = proto.Float64(v[0])
+	case m.Histogram != nil && !isNative(m.Histogram) && len(v) == 2+len(m.Histogram.Bucket):
+		h := m.Histogram
+		h.SampleSum, h.SampleCount = proto.Float64(v[0]), proto.Uint64(uint64(v[1]))
+		for i, b := range h.Bucket {
+			b.CumulativeCount = proto.Uint64(uint64(v[2+i]))
+		}
+	default:
+		return false
+	}
+	return true
 }
 
 // handledType reports whether a family of this type can take the cached path;

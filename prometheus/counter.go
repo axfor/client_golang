@@ -146,7 +146,7 @@ func (c *counter) Add(v float64) {
 	ival := uint64(v)
 	if float64(ival) == v {
 		atomic.AddUint64(&c.valInt, ival)
-		c.track.mark()
+		c.track.count(v)
 		return
 	}
 
@@ -154,7 +154,7 @@ func (c *counter) Add(v float64) {
 		oldBits := atomic.LoadUint64(&c.valBits)
 		newBits := math.Float64bits(math.Float64frombits(oldBits) + v)
 		if atomic.CompareAndSwapUint64(&c.valBits, oldBits, newBits) {
-			c.track.mark()
+			c.track.count(v)
 			return
 		}
 	}
@@ -167,7 +167,7 @@ func (c *counter) AddWithExemplar(v float64, e Labels) {
 
 func (c *counter) Inc() {
 	atomic.AddUint64(&c.valInt, 1)
-	c.track.mark()
+	c.track.count(1)
 }
 
 func (c *counter) get() float64 {

@@ -58,6 +58,9 @@ type TrackedExposer struct {
 	// inScope caches Options.Scope's answer per Desc for one scrape; cleared at
 	// the start of each, so registering or unregistering takes effect then.
 	inScope map[*prometheus.Desc]bool
+	// snap holds the values a scrape read for its picks, the counters' as of
+	// its cut, see snapshotPicks.
+	snap []float64
 	// Each instance's entry is kept in the instance's own tracker slot, see
 	// entryOf, rather than in a map from instance to entry: at two million
 	// instances such a map is about 40 bytes an instance on top of the entries.
@@ -167,13 +170,11 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	e.taken = e.taken[:0]
 	var idle []idleEntry
 
-	// First pass: take what is due, grouped by family, without writing any of it.
-	//
-	// everything written since the previous scrape
-	e.tracker.Take(func(m prometheus.Metric) { e.pick(m, pickChanged) })
-
-	// the bucket due this scrape: top up unchanged series, list idle ones to drop
-	if !e.opts.DisableHeartbeat || e.opts.IdleScrapes > 0 {
+	// The bucket due this scrape: top up unchanged series, list idle ones to drop.
+	walk := func() {
+		if e.opts.DisableHeartbeat && e.opts.IdleScrapes <= 0 {
+			return
+		}
 		bucket := int(e.round % uint64(e.opts.HeartbeatScrapes))
 		e.tracker.RangeBucket(bucket, e.opts.HeartbeatScrapes, func(m prometheus.Metric) {
 			en, slot := entryOf(m)
@@ -189,6 +190,24 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 				e.pick(m, pickHeartbeat)
 			}
 		})
+	}
+	// Without heartbeats the walk only lists idle instances, reading no values:
+	// it runs before the cut is taken, as it covers a share of every instance
+	// there is, and drop checks each one again before deleting it.
+	if e.opts.DisableHeartbeat {
+		walk()
+	}
+
+	// First pass: take what is due, grouped by family, without writing any of it,
+	// and read its values, the counters as of one cut, see ChangeTracker.Cut. No
+	// write waits for it.
+	e.tracker.Cut()
+
+	// everything written since the previous scrape
+	e.tracker.Take(func(m prometheus.Metric) { e.pick(m, pickChanged) })
+
+	if !e.opts.DisableHeartbeat {
+		walk()
 	}
 
 	// Gauges are current values: one left out is a gap for the consumer, not a
@@ -209,7 +228,10 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 		i++
 	}
 
-	// Second pass: write, decide and encode one family at a time.
+	e.snapshotPicks()
+
+	// Second pass: write, decide and encode one family at a time, with the
+	// values read above.
 	round := e.ack.roundID(e.round)
 	w.Header().Set(RoundHeader, round)
 	rs := newResponse(w, r)
@@ -267,6 +289,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	}
 	e.fam.rows, e.fam.nums, e.fam.text = nil, nil, nil
 	e.taken = nil
+	e.snap = nil
 	st.Deleted = e.drop(idle)
 	if st.Aborted {
 		abort(w)

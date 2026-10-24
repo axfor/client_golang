@@ -14,6 +14,8 @@
 package prometheus
 
 import (
+	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -56,6 +58,54 @@ func (r *dirtyRef) mark() {
 	}
 }
 
+// count records a write of v to a counter: enlists it, and adds v to its
+// increments on the current side of the cut. Keep this small enough to inline.
+func (r *dirtyRef) count(v float64) {
+	if d := r.d.Load(); d != nil {
+		d.count(v)
+	}
+}
+
+// count is dirtyRef.count for a tracked instance. It never waits: a write that
+// sees the cut move on while it is being made goes again, on the new side.
+func (d *dirtyState) count(v float64) {
+	s := d.shard
+	cut := &s.tracker.cut
+	for {
+		c := cut.Load()
+		if countHook != nil {
+			countHook(0)
+		}
+		in := &s.inflight[c&1]
+		in.Add(1)
+		if cut.Load() != c {
+			in.Add(-1)
+			continue
+		}
+		if countHook != nil {
+			countHook(1)
+		}
+		since := &d.since[c&1]
+		for {
+			old := since.Load()
+			if since.CompareAndSwap(old, math.Float64bits(math.Float64frombits(old)+v)) {
+				break
+			}
+		}
+		if countHook != nil {
+			countHook(2)
+		}
+		d.mark()
+		in.Add(-1)
+		return
+	}
+}
+
+// countHook, when set, is called by a counter write after it reads the cut (0),
+// after it is registered on its side (1), and before it enlists the instance (2):
+// for the tests of Cut only.
+var countHook func(step int)
+
 // dirtyState is allocated once per tracked instance.
 //
 // owner, home and hash are set when the instance is enlisted and never change:
@@ -71,6 +121,11 @@ type dirtyState struct {
 	hash  uint64         // its bucket in home
 	idx   int            // index into the shard's all slice, for removal; under shard.allMu
 	slot  unsafe.Pointer // the consumer's, see TrackerSlot
+	// A counter's increments, as float64 bits, on each side of the last cut, by
+	// the parity of the cut they were made in, and its value as of the last cut,
+	// which only the consumer touches; see ChangeTracker.Cut and CutValue.
+	since [2]atomic.Uint64
+	atCut float64
 }
 
 // live returns the instance, or nil once it has been deleted from its Vec.
@@ -99,6 +154,11 @@ func (d *dirtyState) mark() {
 }
 
 type dirtyShard struct {
+	tracker *ChangeTracker
+	// inflight counts the counter writes in progress on each side of the cut,
+	// by the parity of the cut they were made in; see ChangeTracker.Cut.
+	inflight [2]atomic.Int64
+
 	mu        sync.Mutex
 	epoch     atomic.Uint32
 	dirty     []*dirtyState
@@ -143,6 +203,86 @@ func (s *dirtyShard) add(d *dirtyState) {
 // without interfering with each other.
 type ChangeTracker struct {
 	shards [dirtyShardCount]dirtyShard
+	// cut counts the cuts taken, see Cut; a counter write goes to the side of
+	// the cut current when it is made.
+	cut atomic.Uint64
+	// atomic is held shared by Atomically and exclusively by Cut while it
+	// moves the cut on.
+	atomic sync.RWMutex
+}
+
+// Cut divides the counter writes into those before it and those after, and
+// returns its number. A scrape reports what was written
+// before its cut and nothing after it, all counters taken at one moment, so it
+// never reports a write without the writes made before it, such as the cost of
+// a request without its tokens; reading one counter after another as they are
+// written could.
+//
+// No write waits for it: moving the cut on is one atomic add. Cut itself waits
+// for the writes made before it to finish, which take nanoseconds, and for the
+// groups of Atomically in progress. Take, after Cut, hands out every counter
+// written before it, with what was written before it added into its value as of
+// the cut, see CutValue.
+func (t *ChangeTracker) Cut() uint64 {
+	t.atomic.Lock()
+	c := t.cut.Add(1) - 1
+	t.atomic.Unlock()
+	for i := range t.shards {
+		for t.shards[i].inflight[c&1].Load() != 0 {
+			runtime.Gosched()
+		}
+	}
+	return c
+}
+
+// CutValue returns the value of the counter m as of the last cut that Take
+// handed it out after: the sum of the writes made before that cut, none made
+// after. It reports false for a metric that is not tracked, and is only
+// meaningful for counters.
+func CutValue(m Metric) (float64, bool) {
+	ref, ok := dirtyRefOf(m)
+	if !ok {
+		return 0, false
+	}
+	d := ref.d.Load()
+	if d == nil {
+		return 0, false
+	}
+	return d.atCut, true
+}
+
+// fold adds the writes made before cut into the value as of the cut, for Take,
+// which hands out every instance written before it: done there, for each, they
+// cannot be left behind on their side, to be mixed with writes made after the
+// next cut. An instance already written after the cut is put back in the dirty
+// list, which Take has just emptied.
+func (d *dirtyState) fold(cut uint64) {
+	d.atCut += math.Float64frombits(d.since[cut&1].Swap(0))
+	if d.since[(cut+1)&1].Load() != 0 {
+		d.mark()
+	}
+}
+
+// Atomically runs f, writes to counters that belong together, such as the
+// tokens and the cost of one request, so that a scrape reports all of them or
+// none. Without it a scrape still never reports a write without the writes made
+// before it, see Cut, but one whose cut falls between two writes of f reports
+// the first and leaves the second to the next scrape.
+//
+// Writes in f wait for nothing, and nothing else waits for them; a cut waits for
+// every f in progress before it moves on, and an f begun meanwhile waits for
+// that, which is as long as the f in progress take. Keep f to the writes, with
+// no I/O or other waiting in it, and do not call Atomically from within f, which
+// can wait for itself. Without change tracking on it just runs f.
+func Atomically(f func()) {
+	t := tracker.Load()
+	if t == nil {
+		f()
+		return
+	}
+	t.atomic.RLock()
+	defer t.atomic.RUnlock()
+	f()
 }
 
 // NewChangeTracker returns a new tracker.
@@ -150,6 +290,7 @@ func NewChangeTracker() *ChangeTracker {
 	t := &ChangeTracker{}
 	for i := range t.shards {
 		t.shards[i].epoch.Store(1)
+		t.shards[i].tracker = t
 	}
 	return t
 }
@@ -337,6 +478,8 @@ func (t *ChangeTracker) Take(fn func(Metric)) {
 	if t == nil {
 		return
 	}
+	// the writes before the last cut, see Cut; none before the first
+	c := t.cut.Load()
 	for i := range t.shards {
 		s := &t.shards[i]
 		s.mu.Lock()
@@ -347,6 +490,9 @@ func (t *ChangeTracker) Take(fn func(Metric)) {
 		s.mu.Unlock()
 
 		for _, d := range taken {
+			if c > 0 {
+				d.fold(c - 1)
+			}
 			if m := d.live(); m != nil {
 				fn(m)
 			}
