@@ -321,12 +321,14 @@ type entry struct {
 	// that is what takes the entry from 120 bytes to 112, a size class down.
 	born uint32
 
-	value     float64  // counter / gauge: last delivered value
-	sum       float64  // histogram: last delivered _sum
-	count     uint64   // histogram: last delivered _count
-	buckets   []uint64 // histogram: last delivered cumulative count per le
-	changed   uint64   // last scrape whose value differed from the delivered one
-	lastRound uint64   // last scrape this was seen in
+	value     float64 // counter / gauge: last delivered value
+	changed   uint64  // last scrape whose value differed from the delivered one
+	lastRound uint64  // last scrape this was seen in
+
+	// A histogram's last delivered sum, count and buckets, allocated when it is
+	// first committed. Most instances are counters: inline, the 40 bytes put
+	// every entry a size class up, 96 bytes instead of 64.
+	hist *histDelivered
 
 	// What Options.Delete is called with; nil unless one is set. The family and
 	// labels were held inline on every entry, 24 bytes, for a callback most
@@ -584,7 +586,8 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		// bytes on each and a bucket array on most histograms, for the part of a
 		// scrape between reading a value and delivering it.
 		var buckets []uint64
-		changed := count != en.count || sum != en.sum
+		dsum, dcount, dbuckets := en.delivered()
+		changed := count != dcount || sum != dsum
 		if changed {
 			en.changed = e.round
 			buckets = make([]uint64, len(h.Bucket))
@@ -597,12 +600,12 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		}
 		e.rb.rebaseEntry(en)
 		if e.opts.ReportIncrements {
-			*h.SampleSum = sum - en.sum
-			*h.SampleCount = count - en.count
+			*h.SampleSum = sum - dsum
+			*h.SampleCount = count - dcount
 			for i, b := range h.Bucket {
 				var prev uint64
-				if i < len(en.buckets) {
-					prev = en.buckets[i]
+				if i < len(dbuckets) {
+					prev = dbuckets[i]
 				}
 				*b.CumulativeCount = b.GetCumulativeCount() - prev
 			}
@@ -690,13 +693,41 @@ func (e *Exposer) heartbeatTurn(family string, en *entry) bool {
 
 // commit records the values read this scrape as the last delivered ones.
 func (e *Exposer) commit(pending []pendingCommit) {
-	for _, pc := range pending {
-		pc.en.value = pc.value
-		pc.en.sum = pc.sum
-		pc.en.count = pc.count
-		if pc.buckets != nil {
-			pc.en.buckets = pc.buckets
-		}
+	for i := range pending {
+		pending[i].apply()
+	}
+}
+
+// histDelivered is a histogram's last delivered _sum, _count and cumulative
+// count per le, see entry.hist.
+type histDelivered struct {
+	sum     float64
+	count   uint64
+	buckets []uint64
+}
+
+// delivered returns the histogram's last delivered sum, count and buckets.
+func (en *entry) delivered() (float64, uint64, []uint64) {
+	if h := en.hist; h != nil {
+		return h.sum, h.count, h.buckets
+	}
+	return 0, 0, nil
+}
+
+// apply makes the values read the last delivered ones.
+func (pc *pendingCommit) apply() {
+	pc.en.value = pc.value
+	if pc.en.kind != dto.MetricType_HISTOGRAM {
+		return
+	}
+	h := pc.en.hist
+	if h == nil {
+		h = &histDelivered{}
+		pc.en.hist = h
+	}
+	h.sum, h.count = pc.sum, pc.count
+	if pc.buckets != nil {
+		h.buckets = pc.buckets
 	}
 }
 

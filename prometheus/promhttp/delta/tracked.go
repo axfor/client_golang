@@ -310,13 +310,8 @@ func (e *TrackedExposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) 
 }
 
 func (e *TrackedExposer) commit(pending []pendingCommit) {
-	for _, pc := range pending {
-		pc.en.value = pc.value
-		pc.en.sum = pc.sum
-		pc.en.count = pc.count
-		if pc.buckets != nil {
-			pc.en.buckets = pc.buckets
-		}
+	for i := range pending {
+		pending[i].apply()
 	}
 }
 

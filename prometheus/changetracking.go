@@ -111,15 +111,18 @@ var countHook func(step int)
 // owner, home and hash are set when the instance is enlisted and never change:
 // a deleted instance is marked dead instead of having them cleared, because a
 // write, Take and RangeBucket may all be reading them at that moment. The fields
-// stay at 64 bytes, dead taking the padding after epoch.
+// stay at 80 bytes, a size class down from 96: dead shares a word with the
+// instance's index in its shard, see pos, next to epoch.
 type dirtyState struct {
 	epoch atomic.Uint32 // shard epoch as of the last time this entered the dirty list
-	dead  atomic.Bool   // deleted from its Vec; owner is no longer handed out
+	// pos is posDead once deleted from its Vec, when owner is no longer handed
+	// out, and the index into the shard's all slice plus one, 0 when it is in
+	// none; the index is set under shard.allMu.
+	pos   atomic.Uint32
 	shard *dirtyShard
 	owner Metric
 	home  *metricMap     // the Vec this instance belongs to, so it can be dropped
 	hash  uint64         // its bucket in home
-	idx   int            // index into the shard's all slice, for removal; under shard.allMu
 	slot  unsafe.Pointer // the consumer's, see TrackerSlot
 	// A counter's increments, as float64 bits, on each side of the last cut, by
 	// the parity of the cut they were made in, and its value as of the last cut,
@@ -128,9 +131,35 @@ type dirtyState struct {
 	atCut float64
 }
 
+// posDead marks dirtyState.pos of a deleted instance.
+const posDead = 1 << 31
+
+func (d *dirtyState) dead() bool { return d.pos.Load()&posDead != 0 }
+
+func (d *dirtyState) markDead() {
+	for {
+		v := d.pos.Load()
+		if d.pos.CompareAndSwap(v, v|posDead) {
+			return
+		}
+	}
+}
+
+// index is the instance's index in its shard's all slice, -1 when in none.
+func (d *dirtyState) index() int { return int(d.pos.Load()&^posDead) - 1 }
+
+func (d *dirtyState) setIndex(i int) {
+	for {
+		v := d.pos.Load()
+		if d.pos.CompareAndSwap(v, v&posDead|uint32(i+1)) {
+			return
+		}
+	}
+}
+
 // live returns the instance, or nil once it has been deleted from its Vec.
 func (d *dirtyState) live() Metric {
-	if d.dead.Load() {
+	if d.dead() {
 		return nil
 	}
 	return d.owner
@@ -343,7 +372,10 @@ func trackMetric(home *metricMap, m Metric, hash uint64) {
 	ref.d.Store(d)
 
 	s.allMu.Lock()
-	d.idx = len(s.all)
+	if len(s.all) >= posDead-1 {
+		panic("prometheus: more tracked instances in one change-tracking shard than it can index")
+	}
+	d.setIndex(len(s.all))
 	s.all = append(s.all, d)
 	s.allMu.Unlock()
 
@@ -364,14 +396,14 @@ func untrackMetric(m Metric) {
 	if d == nil {
 		return
 	}
-	d.dead.Store(true)
+	d.markDead()
 	s := d.shard
 
 	s.allMu.Lock()
-	if d.idx >= 0 && d.idx < len(s.all) && s.all[d.idx] == d {
+	if i := d.index(); i >= 0 && i < len(s.all) && s.all[i] == d {
 		last := len(s.all) - 1
-		s.all[d.idx] = s.all[last]
-		s.all[d.idx].idx = d.idx
+		s.all[i] = s.all[last]
+		s.all[i].setIndex(i)
 		s.all[last] = nil
 		s.all = s.all[:last]
 		if n := len(s.all); n > s.allPeak {
@@ -381,7 +413,7 @@ func untrackMetric(m Metric) {
 			s.all = shrunk(s.all, s.allPeak)
 		}
 	}
-	d.idx = -1
+	d.setIndex(-1)
 	s.allMu.Unlock()
 }
 
@@ -438,7 +470,7 @@ func liveDirtyState(m Metric) *dirtyState {
 		return nil
 	}
 	d := ref.d.Load()
-	if d == nil || d.dead.Load() {
+	if d == nil || d.dead() {
 		return nil
 	}
 	return d

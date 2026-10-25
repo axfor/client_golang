@@ -105,9 +105,10 @@ func (rb *rebaseState) rebaseEntry(en *entry) {
 	x := en.ext()
 	x.basedOn = rb.gen
 	x.baseValue = en.value
-	x.baseSum = en.sum
-	x.baseCount = en.count
-	x.baseBuckets = append(x.baseBuckets[:0], en.buckets...)
+	sum, count, buckets := en.delivered()
+	x.baseSum = sum
+	x.baseCount = count
+	x.baseBuckets = append(x.baseBuckets[:0], buckets...)
 }
 
 func (en *entry) baseBucket(i int) uint64 {
