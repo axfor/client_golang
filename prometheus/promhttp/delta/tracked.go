@@ -58,9 +58,6 @@ type TrackedExposer struct {
 	// inScope caches Options.Scope's answer per Desc for one scrape; cleared at
 	// the start of each, so registering or unregistering takes effect then.
 	inScope map[*prometheus.Desc]bool
-	// snap holds the values a scrape read for its picks, the counters' as of
-	// its cut, see snapshotPicks.
-	snap []float64
 	// Each instance's entry is kept in the instance's own tracker slot, see
 	// entryOf, rather than in a map from instance to entry: at two million
 	// instances such a map is about 40 bytes an instance on top of the entries.
@@ -205,8 +202,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	}
 
 	// First pass: take what is due, grouped by family, without writing any of it,
-	// and read its values, the counters as of one cut, see ChangeTracker.Cut. No
-	// write waits for it.
+	// the counters as of one cut, see ChangeTracker.Cut. No write waits for it.
 	e.tracker.Cut()
 
 	// everything written since the previous scrape
@@ -234,10 +230,8 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 		i++
 	}
 
-	e.snapshotPicks()
-
-	// Second pass: write, decide and encode one family at a time, with the
-	// values read above.
+	// Second pass: write, decide and encode one family at a time; the counters
+	// as of the cut, see emitFamily.
 	round := e.ack.roundID(e.round)
 	w.Header().Set(RoundHeader, round)
 	w.Header().Set(FeaturesHeader, features)
@@ -296,7 +290,6 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	}
 	e.fam.rows, e.fam.nums, e.fam.text = nil, nil, nil
 	e.taken = nil
-	e.snap = nil
 	st.Deleted = e.drop(idle)
 	if st.Aborted {
 		abort(w)
@@ -347,12 +340,17 @@ func (e *TrackedExposer) drop(idle []idleEntry) int {
 				family, labels = d.family, d.labels
 			}
 			e.opts.Delete(family, labels)
+			if !prometheus.TrackedDeleted(x.m) {
+				// A Delete that left the child in place must see it start over as
+				// new, as it did when the entry left a map.
+				*x.slot = nil
+			}
 		} else if !prometheus.DeleteTrackedIfUnwritten(x.m) {
 			continue
 		}
-		// Cleared whichever way it went: a Delete that left the child in place
-		// must see it start over as new, as it did when the entry left a map.
-		*x.slot = nil
+		// A deleted instance keeps its entry: written after the deletion by a
+		// caller that looked it up before, it is settled against what it
+		// delivered, see settleDeleted. Unwritten, it goes with the instance.
 		e.live--
 		n++
 	}

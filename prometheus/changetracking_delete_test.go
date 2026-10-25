@@ -16,6 +16,9 @@ package prometheus
 import (
 	"sync"
 	"testing"
+	"unsafe"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Deleting an instance while requests write to it, and while the consumer takes
@@ -91,7 +94,10 @@ func TestDeleteTrackedIfUnwritten(t *testing.T) {
 	if v.WithLabelValues("a") == c {
 		t.Fatal("the deleted instance is still in its Vec")
 	}
-	// A write to the deleted instance is not handed out.
+	// A write to the deleted instance, by a caller that looked it up before the
+	// deletion, is not lost: the instance is handed out, deleted, for the
+	// consumer to settle. With a newer instance under its labels, it stays
+	// deleted and ReviveTracked names that one, to move its writes into.
 	c.Inc()
 	n := 0
 	tr.Take(func(m Metric) {
@@ -99,8 +105,92 @@ func TestDeleteTrackedIfUnwritten(t *testing.T) {
 			n++
 		}
 	})
-	if n != 0 {
-		t.Fatal("a deleted instance was handed out")
+	if n != 1 || !TrackedDeleted(c) {
+		t.Fatalf("a deleted instance written since was handed out %d times, deleted %v; want once, deleted", n, TrackedDeleted(c))
+	}
+	if now, slot := ReviveTracked(c); now == c || now != v.WithLabelValues("a") || slot == nil {
+		t.Fatal("with a newer instance under its labels, the deleted one was put back, or the newer one not named")
+	}
+}
+
+// A deleted instance written since, with nothing in its Vec under its labels, is
+// put back as it was: its tracking, its slot and its value.
+func TestReviveTracked(t *testing.T) {
+	tr := NewChangeTracker()
+	SetChangeTracker(tr)
+	defer SetChangeTracker(nil)
+	v := NewCounterVec(CounterOpts{Name: "c", Help: "c"}, []string{"k", "l"})
+	c := v.WithLabelValues("a", "b")
+	c.Add(3)
+	slot := TrackerSlot(c)
+	marker := new(int)
+	*slot = unsafe.Pointer(marker)
+	tr.Take(func(Metric) {})
+	if !DeleteTrackedIfUnwritten(c) {
+		t.Fatal("not deleted")
+	}
+	c.Add(5)
+	tr.Cut()
+	var taken []Metric
+	tr.Take(func(m Metric) { taken = append(taken, m) })
+	if len(taken) != 1 || taken[0] != c {
+		t.Fatalf("taken %v; want the deleted instance", taken)
+	}
+	now, s := ReviveTracked(c)
+	if now != c || s == nil || *s != unsafe.Pointer(marker) {
+		t.Fatal("not put back with its slot")
+	}
+	if TrackedDeleted(c) || TrackerSlot(c) == nil || v.WithLabelValues("a", "b") != c {
+		t.Fatal("put back, but not tracked or not in its Vec")
+	}
+	if got, _ := CutValue(c); got != 8 {
+		t.Fatalf("CutValue %v; want 8, the 3 and the 5 written after the deletion", got)
+	}
+	n := 0
+	tr.RangeBucket(0, 1, func(m Metric) {
+		if m == c {
+			n++
+		}
+	})
+	if n != 1 {
+		t.Fatalf("the instance put back is walked %d times; want once", n)
+	}
+}
+
+// What a deleted instance had not delivered goes into the newer one: a counter
+// as of the cut, a classic histogram as observations.
+func TestAddTrackedCutAndHistogram(t *testing.T) {
+	tr := NewChangeTracker()
+	SetChangeTracker(tr)
+	defer SetChangeTracker(nil)
+	cv := NewCounterVec(CounterOpts{Name: "c", Help: "c"}, []string{"k"})
+	c := cv.WithLabelValues("a")
+	c.Add(2)
+	tr.Cut()
+	tr.Take(func(Metric) {})
+	if !AddTrackedCut(c, 1.5) || AddTrackedCut(c, -1) {
+		t.Fatal("AddTrackedCut refused a counter, or took a negative value")
+	}
+	var m dto.Metric
+	_ = c.Write(&m)
+	if got, _ := CutValue(c); got != 3.5 || m.GetCounter().GetValue() != 3.5 || !TrackedWritten(c) {
+		t.Fatalf("CutValue %v, value %v, written %v; want 3.5, 3.5, true", got, m.GetCounter().GetValue(), TrackedWritten(c))
+	}
+
+	hv := NewHistogramVec(HistogramOpts{Name: "h", Help: "h", Buckets: []float64{1, 10}}, []string{"k"})
+	h := hv.WithLabelValues("a").(Histogram)
+	h.Observe(20)
+	if !AddTrackedHistogram(h.(Metric), []uint64{2, 3}, 4, 30.5) {
+		t.Fatal("AddTrackedHistogram refused a classic histogram")
+	}
+	m.Reset()
+	_ = h.(Metric).Write(&m)
+	hh := m.GetHistogram()
+	if hh.GetSampleCount() != 5 || hh.GetSampleSum() != 50.5 || hh.Bucket[0].GetCumulativeCount() != 2 || hh.Bucket[1].GetCumulativeCount() != 3 {
+		t.Fatalf("histogram after the add: %v", hh)
+	}
+	if AddTrackedHistogram(c, []uint64{1}, 1, 1) {
+		t.Fatal("AddTrackedHistogram took a counter")
 	}
 }
 

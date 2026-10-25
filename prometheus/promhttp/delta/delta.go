@@ -324,6 +324,10 @@ type entry struct {
 	value     float64 // counter / gauge: last delivered value
 	changed   uint64  // last scrape whose value differed from the delivered one
 	lastRound uint64  // last scrape this was seen in
+	// picked is the last scrape that picked it, see TrackedExposer.pick: an
+	// instance goes out once in a scrape. It fills the entry to 64 bytes, the
+	// size class it was in.
+	picked uint64
 
 	// A histogram's last delivered sum, count and buckets, allocated when it is
 	// first committed. Most instances are counters: inline, the 40 bytes put

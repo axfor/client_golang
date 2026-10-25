@@ -19,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 // Change tracking, used by the change-only and delta exposition in
@@ -44,8 +46,11 @@ const dirtyShardCount = 256
 // wide and stays nil unless the metric was created while a ChangeTracker was set.
 //
 // The pointer is atomic because a write reads it while the instance may be
-// deleted from its Vec, which clears it. On amd64 the load is a plain move and
-// on arm64 a load-acquire, next to the atomic add every write already does.
+// tracked at that moment. It is never cleared: an instance deleted from its Vec
+// keeps it, so that a write by a caller that looked the instance up before the
+// deletion is still recorded, and its consumer settles it, see ReviveTracked. On
+// amd64 the load is a plain move and on arm64 a load-acquire, next to the
+// atomic add every write already does.
 type dirtyRef struct {
 	d atomic.Pointer[dirtyState]
 }
@@ -136,10 +141,23 @@ const posDead = 1 << 31
 
 func (d *dirtyState) dead() bool { return d.pos.Load()&posDead != 0 }
 
-func (d *dirtyState) markDead() {
+// markDead marks d deleted from its Vec, and reports whether it was not yet.
+func (d *dirtyState) markDead() bool {
 	for {
 		v := d.pos.Load()
+		if v&posDead != 0 {
+			return false
+		}
 		if d.pos.CompareAndSwap(v, v|posDead) {
+			return true
+		}
+	}
+}
+
+func (d *dirtyState) clearDead() {
+	for {
+		v := d.pos.Load()
+		if d.pos.CompareAndSwap(v, v&^posDead) {
 			return
 		}
 	}
@@ -382,21 +400,23 @@ func trackMetric(home *metricMap, m Metric, hash uint64) {
 	s.add(d)
 }
 
-// untrackMetric drops an instance a Vec has just deleted.
+// untrackMetric drops an instance a Vec has just deleted from the instances
+// heartbeats and idle cleanup walk.
 //
-// A write racing with the delete can still enlist the old dirtyState; Take skips
-// it because it is dead by then. Nothing is cleared, so such an in-flight mark,
-// and a Take or RangeBucket holding it, read what they read before.
+// It stays tracked otherwise: a caller that looked it up before the deletion
+// and writes to it after enlists it, as any write does, and Take hands it out,
+// for its consumer to settle, see ReviveTracked. Nothing is cleared, so an
+// in-flight mark, and a Take or RangeBucket holding it, read what they read
+// before.
 func untrackMetric(m Metric) {
 	ref, ok := dirtyRefOf(m)
 	if !ok {
 		return
 	}
-	d := ref.d.Swap(nil)
-	if d == nil {
+	d := ref.d.Load()
+	if d == nil || !d.markDead() {
 		return
 	}
-	d.markDead()
 	s := d.shard
 
 	s.allMu.Lock()
@@ -425,9 +445,9 @@ func untrackMetric(m Metric) {
 // tracked, or were already removed, report false.
 //
 // Deleting is not coordinated with writes. A request holding this instance while
-// it is removed writes into a child no longer in the Vec, and that write is lost.
-// That is how Vec.Delete behaves as well; only delete what has been idle long
-// enough for this to be vanishingly unlikely.
+// it is removed writes into a child no longer in the Vec; the write is still
+// recorded, and Take hands the instance out for its consumer to settle, see
+// ReviveTracked. The same holds for Vec.Delete of a tracked instance.
 func DeleteTracked(m Metric) bool {
 	d := liveDirtyState(m)
 	if d == nil {
@@ -444,10 +464,11 @@ func DeleteTracked(m Metric) bool {
 // stale while it works: a request that looks the key up in the meantime gets this
 // instance, still in the Vec, and its write would be lost with it. The check
 // covers every write that has enlisted the instance by the time the Vec is
-// locked, and no new lookup can find the instance while it is. What is left is a
-// write between its value update and its enlisting, and one by a caller that
-// looked the instance up before the lock and writes after it, as with any
-// Vec.Delete.
+// locked, and no new lookup can find the instance while it is. A write between
+// its value update and its enlisting, or by a caller that looked the instance up
+// before the lock and writes after it, lands in the deleted instance, and is
+// settled by the consumer as any write to a deleted instance is, see
+// ReviveTracked.
 func DeleteTrackedIfUnwritten(m Metric) bool {
 	d := liveDirtyState(m)
 	if d == nil {
@@ -506,6 +527,10 @@ func dirtyRefOf(m Metric) (*dirtyRef, bool) {
 // Take hands every instance written since the previous call to fn and advances
 // the batch. It must be called by a single consumer, the same constraint that
 // change-only exposition carries anyway.
+//
+// An instance deleted from its Vec and written since is handed out too, see
+// TrackedDeleted: written by a caller that looked it up before the deletion, a
+// write the consumer settles with ReviveTracked rather than losing.
 func (t *ChangeTracker) Take(fn func(Metric)) {
 	if t == nil {
 		return
@@ -525,9 +550,9 @@ func (t *ChangeTracker) Take(fn func(Metric)) {
 			if c > 0 {
 				d.fold(c - 1)
 			}
-			if m := d.live(); m != nil {
-				fn(m)
-			}
+			// a deleted instance too: it was written after it was deleted, see
+			// ReviveTracked
+			fn(d.owner)
 		}
 
 		s.mu.Lock()
@@ -593,4 +618,139 @@ func TrackerCapacity(t *ChangeTracker) int {
 		s.mu.Unlock()
 	}
 	return total
+}
+
+// TrackedDeleted reports whether m, a tracked instance, has been deleted from
+// its Vec. Take hands out such an instance when it is written after the
+// deletion; see ReviveTracked.
+func TrackedDeleted(m Metric) bool {
+	ref, ok := dirtyRefOf(m)
+	if !ok {
+		return false
+	}
+	d := ref.d.Load()
+	return d != nil && d.dead()
+}
+
+// ReviveTracked settles m, an instance deleted from its Vec that Take has handed
+// out: written after the deletion, by a caller that looked it up before. Such a
+// write is not lost.
+//
+// If the Vec has no instance with m's labels, m is put back in it, tracked as
+// before, with its TrackerSlot and everything in it, as if it had never been
+// deleted, and ReviveTracked returns m. Otherwise -- a later lookup has created
+// a new instance with the same labels -- it returns that one: what m has not
+// delivered goes into it, with Counter.Add or AddTrackedHistogram, and m stays
+// deleted. slot is m's TrackerSlot either way.
+//
+// It must be called by the tracker's consumer. For an instance not deleted it
+// returns m and its slot.
+func ReviveTracked(m Metric) (Metric, *unsafe.Pointer) {
+	ref, ok := dirtyRefOf(m)
+	if !ok {
+		return m, nil
+	}
+	d := ref.d.Load()
+	if d == nil {
+		return m, nil
+	}
+	if !d.dead() {
+		return m, &d.slot
+	}
+	home := d.home
+	lvs, ok := labelValuesOf(m, home.desc)
+	if !ok {
+		return m, &d.slot
+	}
+	home.mtx.Lock()
+	defer home.mtx.Unlock()
+	if now, found := home.getMetricWithHashAndLabelValues(d.hash, lvs, nil); found {
+		return now, &d.slot
+	}
+	home.metrics[d.hash] = append(home.metrics[d.hash], metricWithLabelValues{values: lvs, metric: m})
+	if n := len(home.metrics); n > home.peak {
+		home.peak = n
+	}
+	s := d.shard
+	s.allMu.Lock()
+	d.setIndex(len(s.all))
+	s.all = append(s.all, d)
+	s.allMu.Unlock()
+	d.clearDead()
+	return m, &d.slot
+}
+
+// labelValuesOf returns the values of m's variable labels, in the order of
+// desc's: what its Vec keeps it under.
+func labelValuesOf(m Metric, desc *Desc) ([]string, bool) {
+	var out dto.Metric
+	if err := m.Write(&out); err != nil {
+		return nil, false
+	}
+	names := desc.variableLabels.names
+	lvs := make([]string, len(names))
+	for i, name := range names {
+		found := false
+		for _, lp := range out.Label {
+			if lp.GetName() == name {
+				lvs[i], found = lp.GetValue(), true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	return lvs, true
+}
+
+// AddTrackedCut adds v to c, a tracked counter, as written before the last cut:
+// it is in CutValue(c) at once, and in c's value. It is what a deleted instance
+// had not delivered of the writes made before that cut, see ReviveTracked,
+// moved into the instance that has its labels now, and goes out with the
+// scrape of that cut. It reports false, adding nothing, for anything else.
+// Only the tracker's consumer calls it, between Take and the next Cut.
+func AddTrackedCut(c Metric, v float64) bool {
+	ct, ok := c.(*counter)
+	if !ok || v <= 0 {
+		return false
+	}
+	d := ct.track.d.Load()
+	if d == nil {
+		return false
+	}
+	if ival := uint64(v); float64(ival) == v {
+		atomic.AddUint64(&ct.valInt, ival)
+	} else {
+		atomicAddFloat(&ct.valBits, v)
+	}
+	d.atCut += v
+	d.mark()
+	return true
+}
+
+// AddTrackedHistogram adds to h, a classic histogram, count observations
+// summing to sum, cumulative[i] of them at or below its i-th upper bound, as
+// if they had been observed one by one: what a deleted instance had not
+// delivered, see ReviveTracked. It reports false, adding nothing, for anything
+// else, a native histogram among it, whose sparse buckets these cannot fill.
+func AddTrackedHistogram(h Metric, cumulative []uint64, count uint64, sum float64) bool {
+	hi, ok := h.(*histogram)
+	if !ok || hi.nativeHistogramSchema > math.MinInt32 || len(cumulative) > len(hi.upperBounds) || count == 0 {
+		return false
+	}
+	n := atomic.AddUint64(&hi.countAndHotIdx, count)
+	hot := hi.counts[n>>63]
+	var prev uint64
+	for i, c := range cumulative {
+		if c > prev {
+			atomic.AddUint64(&hot.buckets[i], c-prev)
+		}
+		prev = c
+	}
+	atomicAddFloat(&hot.sumBits, sum)
+	// last, as observe does: the count marks the observations complete
+	atomic.AddUint64(&hot.count, count)
+	hi.track.mark()
+	return true
 }
