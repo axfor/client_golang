@@ -50,15 +50,29 @@ import (
 // curl, commits the held round and its own on delivery, as before the protocol:
 // the single scraper rule stands for anything that does not acknowledge.
 //
-// What is left: a scraper that restarts between a round and its next request,
-// which commits the round, as delivery did; and one that processes a response in
-// part and then fails, which the protocol cannot express, so the round is rolled
-// back and what was processed is counted again.
+// A scraper about to stop sends its last acknowledgement on a request of its
+// own, with FinalHeader: the held round is settled by it, and nothing is taken,
+// so the process after it, which starts with AckNew, finds no round held for it
+// to commit unprocessed. Every response says the target takes it, in
+// FeaturesHeader; a scraper sends it only to a target that says so, since one
+// that does not would take the request for a scrape and hold a round nobody
+// processes.
+//
+// What is left: a scraper that stops without sending it -- killed, or crashed --
+// between a round and its next request, which commits the round, as delivery
+// did; and one that processes a response in part and then fails, which the
+// protocol cannot express, so the round is rolled back and what was processed
+// is counted again.
 const (
-	RoundHeader = "X-Prometheus-Delta-Round"
-	AckHeader   = "X-Prometheus-Delta-Ack"
-	AckNew      = "new"
-	AckPeek     = "peek"
+	RoundHeader    = "X-Prometheus-Delta-Round"
+	AckHeader      = "X-Prometheus-Delta-Ack"
+	FinalHeader    = "X-Prometheus-Delta-Final"
+	FeaturesHeader = "X-Prometheus-Delta-Features"
+	AckNew         = "new"
+	AckPeek        = "peek"
+
+	// features is the value of FeaturesHeader.
+	features = "final"
 )
 
 // ackState holds the round awaiting acknowledgement.
@@ -92,6 +106,12 @@ func ackOf(r *http.Request) (string, bool) {
 func acknowledges(r *http.Request) bool {
 	v, ok := ackOf(r)
 	return ok && v != AckPeek
+}
+
+// final reports whether r is a scraper's last acknowledgement, see FinalHeader:
+// it settles the held round and takes nothing.
+func final(r *http.Request) bool {
+	return r != nil && r.Header.Get(FinalHeader) != "" && acknowledges(r)
 }
 
 // peeks reports whether r only looks at the response.

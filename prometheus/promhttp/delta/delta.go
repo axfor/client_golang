@@ -418,6 +418,12 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 		}
 		e.held = nil
 	}
+	if final(r) {
+		// the scraper's last acknowledgement: nothing more is taken
+		w.Header().Set(FeaturesHeader, features)
+		w.WriteHeader(http.StatusNoContent)
+		return st
+	}
 
 	mfs, err := e.g.Gather()
 	if err != nil {
@@ -451,6 +457,7 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 
 	round := e.ack.roundID(e.round)
 	w.Header().Set(RoundHeader, round)
+	w.Header().Set(FeaturesHeader, features)
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	gatherErr := st.Err

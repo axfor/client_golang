@@ -159,6 +159,12 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 		}
 		e.held = nil
 	}
+	if final(r) {
+		// the scraper's last acknowledgement: nothing more is taken
+		w.Header().Set(FeaturesHeader, features)
+		w.WriteHeader(http.StatusNoContent)
+		return st
+	}
 
 	e.round++
 	st.Round = e.round
@@ -234,6 +240,7 @@ func (e *TrackedExposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeSta
 	// values read above.
 	round := e.ack.roundID(e.round)
 	w.Header().Set(RoundHeader, round)
+	w.Header().Set(FeaturesHeader, features)
 	rs := newResponse(w, r)
 	enc := expfmt.NewEncoder(rs.w, expfmt.NewFormat(expfmt.TypeTextPlain))
 	var pending []pendingCommit
