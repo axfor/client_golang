@@ -341,9 +341,13 @@ func (e *TrackedExposer) drop(idle []idleEntry) int {
 			}
 			e.opts.Delete(family, labels)
 			if !prometheus.TrackedDeleted(x.m) {
-				// A Delete that left the child in place must see it start over as
-				// new, as it did when the entry left a map.
-				*x.slot = nil
+				// The callback left the child in its Vec, of a family it does not
+				// know, say. The child carries on with the value it holds, so it
+				// keeps its entry: started over as new, its next write would report
+				// all of that value again. It is offered to the callback again
+				// once it has been idle for another IdleScrapes scrapes.
+				x.en.changed = e.round
+				continue
 			}
 		} else if !prometheus.DeleteTrackedIfUnwritten(x.m) {
 			continue

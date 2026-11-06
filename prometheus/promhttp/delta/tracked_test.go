@@ -809,29 +809,39 @@ func TestEntryGoesWithItsInstance(t *testing.T) {
 }
 
 // With Options.Delete the child leaves its Vec only if the callback removes it.
-// One that stays has to start over as a new instance, the way it did when its
-// entry left a map, not carry on from the entry idle cleanup was done with.
-func TestIdleEntryIsLetGoWhenDeleteKeepsTheChild(t *testing.T) {
+// One that stays carries on with the value it holds, so it keeps its entry:
+// started over as new, its next write would report all of that value again.
+// It is offered to the callback again only once it has been idle again.
+func TestIdleEntryStaysWhenDeleteKeepsTheChild(t *testing.T) {
 	var deleted []string
 	f := newTrackedFixture(t, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, HeartbeatScrapes: 1,
 		Delete: func(family string, labels prometheus.Labels) { deleted = append(deleted, labels["key"]) }})
 	f.c.WithLabelValues("keep").Inc()
-	f.c.WithLabelValues("idle").Inc()
+	f.c.WithLabelValues("idle").Add(100)
 	f.scrape(t, false)
-	old := weak.Make(entryFor(t, f.c.WithLabelValues("idle")))
+	before := entryFor(t, f.c.WithLabelValues("idle"))
 
+	deletions := 0
 	for range 5 {
 		f.c.WithLabelValues("keep").Inc()
-		f.scrape(t, false)
+		_, st := f.scrape(t, false)
+		deletions += st.Deleted
 	}
 	if len(deleted) != 1 || deleted[0] != "idle" {
-		t.Fatalf("Delete was called for %v, want [idle]", deleted)
+		t.Fatalf("Delete was called for %v in 5 scrapes, want [idle]: once, then again only after another 2 idle scrapes", deleted)
 	}
-	if n := f.exp.Tracked(); n != 1 {
-		t.Fatalf("tracked %d after idle cleanup, want 1", n)
+	if deletions != 0 {
+		t.Fatalf("%d deletions counted, want 0: the callback kept the child", deletions)
 	}
-	runtime.GC()
-	if old.Value() != nil {
-		t.Error("the entry idle cleanup was done with is still held by the child the callback kept")
+	if n := f.exp.Tracked(); n != 2 {
+		t.Fatalf("tracked %d after idle cleanup, want 2: the child the callback kept keeps its entry", n)
+	}
+	if entryFor(t, f.c.WithLabelValues("idle")) != before {
+		t.Fatal("the child the callback kept has a different entry")
+	}
+
+	f.c.WithLabelValues("idle").Add(1)
+	if m, _ := f.scrape(t, false); m[`c_total{key=idle}`] != 1 {
+		t.Fatalf("the kept child reports %v after a write of 1, want 1, not its whole value again: %v", m[`c_total{key=idle}`], m)
 	}
 }
