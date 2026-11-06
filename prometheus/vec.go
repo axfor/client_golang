@@ -142,16 +142,25 @@ func (m *MetricVec) DeleteCollectedIf(labels []*dto.LabelPair, ok func(Metric) b
 	if !found {
 		return false
 	}
-	for _, c := range m.curry {
-		if lvs[c.index] != c.value {
-			return false // a metric of this vector, but outside its curry
+	// hashLabelValues takes the values other than the curried ones
+	vals := lvs
+	if len(m.curry) > 0 {
+		vals = make([]string, 0, len(lvs)-len(m.curry))
+		iCurry := 0
+		for i, v := range lvs {
+			if iCurry < len(m.curry) && m.curry[iCurry].index == i {
+				if v != m.curry[iCurry].value {
+					return false // a metric of this vector, but outside its curry
+				}
+				iCurry++
+				continue
+			}
+			vals = append(vals, v)
 		}
 	}
-	// what hashLabelValues computes, with the curried values in their places
-	h := hashNew()
-	for _, v := range lvs {
-		h = m.hashAdd(h, v)
-		h = m.hashAddByte(h, model.SeparatorByte)
+	h, err := m.hashLabelValues(vals)
+	if err != nil {
+		return false
 	}
 	return m.deleteCollectedIf(h, lvs, ok)
 }
