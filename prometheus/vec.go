@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sync"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 )
 
@@ -115,6 +116,64 @@ func (m *MetricVec) DeletePartialMatch(labels Labels) int {
 	defer closer()
 
 	return m.deleteByLabels(labels, m.curry)
+}
+
+// DeleteCollectedIf deletes the metric that was collected with these labels,
+// if ok, called with the metric while no lookup can return it, reports true. It
+// returns true if a metric was deleted, and never creates one.
+//
+// The labels are the ones the metric carries when collected, as Write hands
+// them out and a Gatherer reports them. Labels that are not variable labels of
+// this vector -- its const labels, and any a wrapping Registerer adds -- are
+// ignored, and the values are taken as they are, already constrained. A
+// consumer of Gather can delete what it read without knowing the vector's label
+// names.
+//
+// What it is for is deleting a metric found idle in a scrape. A write after the
+// scrape read the metric would be lost with it, so ok compares what the scrape
+// read with what the metric holds now, and the metric stays if they differ. No
+// lookup can return the metric between that check and the deletion. A caller
+// that looked the metric up before and writes to it after still writes into a
+// metric that is no longer in the vector, as with every other way of deleting.
+//
+// ok must not use this vector. A nil ok deletes unconditionally.
+func (m *MetricVec) DeleteCollectedIf(labels []*dto.LabelPair, ok func(Metric) bool) bool {
+	lvs, found := collectedLabelValues(m.desc, labels)
+	if !found {
+		return false
+	}
+	for _, c := range m.curry {
+		if lvs[c.index] != c.value {
+			return false // a metric of this vector, but outside its curry
+		}
+	}
+	// what hashLabelValues computes, with the curried values in their places
+	h := hashNew()
+	for _, v := range lvs {
+		h = m.hashAdd(h, v)
+		h = m.hashAddByte(h, model.SeparatorByte)
+	}
+	return m.deleteCollectedIf(h, lvs, ok)
+}
+
+// collectedLabelValues returns the values of desc's variable labels among
+// labels, in the order of desc's, or false when one of them is missing.
+func collectedLabelValues(desc *Desc, labels []*dto.LabelPair) ([]string, bool) {
+	names := desc.variableLabels.names
+	lvs := make([]string, len(names))
+	for i, name := range names {
+		found := false
+		for _, lp := range labels {
+			if lp.GetName() == name {
+				lvs[i], found = lp.GetValue(), true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	return lvs, true
 }
 
 // Without explicit forwarding of Describe, Collect, Reset, those methods won't
@@ -414,15 +473,7 @@ func (m *metricMap) deleteByHashWithLabelValues(
 		return false
 	}
 
-	untrackMetric(metrics[i].metric) // drop it from the change-tracking table
-	if len(metrics) > 1 {
-		old := metrics
-		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
-		old[len(old)-1] = metricWithLabelValues{}
-	} else {
-		delete(m.metrics, h)
-		m.shrink()
-	}
+	m.removeAt(h, metrics, i)
 	return true
 }
 
@@ -445,18 +496,43 @@ func (m *metricMap) deleteMetric(h uint64, metric Metric, ok func() bool) bool {
 		if ok != nil && !ok() {
 			return false
 		}
-		untrackMetric(metric)
-		if len(metrics) > 1 {
-			old := metrics
-			m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
-			old[len(old)-1] = metricWithLabelValues{}
-		} else {
-			delete(m.metrics, h)
-			m.shrink()
-		}
+		m.removeAt(h, metrics, i)
 		return true
 	}
 	return false
+}
+
+// deleteCollectedIf removes the metric with the label values lvs, every
+// variable label's, from the hash bucket h, if ok, asked under the lock, reports
+// true.
+func (m *metricMap) deleteCollectedIf(h uint64, lvs []string, ok func(Metric) bool) bool {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	metrics := m.metrics[h]
+	i := findMetricWithLabelValues(metrics, lvs, nil)
+	if i >= len(metrics) {
+		return false
+	}
+	if ok != nil && !ok(metrics[i].metric) {
+		return false
+	}
+	m.removeAt(h, metrics, i)
+	return true
+}
+
+// removeAt removes metrics[i], the bucket h, from the map and from change
+// tracking. The caller holds the write lock.
+func (m *metricMap) removeAt(h uint64, metrics []metricWithLabelValues, i int) {
+	untrackMetric(metrics[i].metric) // drop it from the change-tracking table
+	if len(metrics) > 1 {
+		old := metrics
+		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
+		old[len(old)-1] = metricWithLabelValues{}
+	} else {
+		delete(m.metrics, h)
+		m.shrink()
+	}
 }
 
 // deleteByHashWithLabels removes the metric from the hash bucket h. If there
@@ -477,15 +553,7 @@ func (m *metricMap) deleteByHashWithLabels(
 		return false
 	}
 
-	untrackMetric(metrics[i].metric) // drop it from the change-tracking table
-	if len(metrics) > 1 {
-		old := metrics
-		m.metrics[h] = append(metrics[:i], metrics[i+1:]...)
-		old[len(old)-1] = metricWithLabelValues{}
-	} else {
-		delete(m.metrics, h)
-		m.shrink()
-	}
+	m.removeAt(h, metrics, i)
 	return true
 }
 

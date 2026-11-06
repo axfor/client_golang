@@ -687,21 +687,7 @@ func labelValuesOf(m Metric, desc *Desc) ([]string, bool) {
 	if err := m.Write(&out); err != nil {
 		return nil, false
 	}
-	names := desc.variableLabels.names
-	lvs := make([]string, len(names))
-	for i, name := range names {
-		found := false
-		for _, lp := range out.Label {
-			if lp.GetName() == name {
-				lvs[i], found = lp.GetValue(), true
-				break
-			}
-		}
-		if !found {
-			return nil, false
-		}
-	}
-	return lvs, true
+	return collectedLabelValues(desc, out.Label)
 }
 
 // AddTrackedCut adds v to c, a tracked counter, as written before the last cut:
