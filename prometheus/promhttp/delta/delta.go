@@ -30,7 +30,9 @@
 //
 // Usage:
 //
-//	exp := delta.New(reg, delta.Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 30})
+//	opts := delta.Increments()
+//	opts.Vecs = []delta.Vec{tokens, cost} // what idle cleanup deletes from
+//	exp := delta.New(reg, opts)
 //	mux.Handle("/metrics/delta", exp.Handler())
 //
 // Constraints:
@@ -159,22 +161,32 @@ type Options struct {
 	// minutes at a 60s scrape interval.
 	HeartbeatScrapes int
 
-	// IdleScrapes, when greater than zero, drops a series from the state table
-	// after that many scrapes without a write. Together with Delete it also
-	// removes the child from its Vec, so process memory follows the active set.
-	// A series that reappears starts from zero again, which is exactly right in
-	// delta mode.
+	// IdleScrapes, when greater than zero, deletes a series after that many
+	// scrapes without a write: its child leaves its Vec and its state leaves
+	// the exposer, so process memory follows the active set. A series that
+	// reappears starts from zero again, which is exactly right in delta mode.
+	// A series whose child is not deleted keeps its state: dropping the state
+	// alone would make the next scrape report the child's whole value again.
 	//
 	// On the change-tracking path an instance is deleted only if it has not
 	// been written since the scrape took it, checked under the lock of its Vec,
 	// so a request that looks the key up while the scrape is under way keeps its
-	// write. What is left is client_golang's own semantics: a caller holding a
-	// child it looked up earlier and writing to it after it was deleted loses
-	// that write -- never keep children of a Vec this deletes from. The Gather
-	// path cannot tell what was written since it gathered, and deletes right
-	// after gathering to keep that window short. A generous threshold (30 at a
-	// 60s interval, i.e. half an hour without traffic) makes both very unlikely;
-	// leave the option off to rule them out and keep every instance resident.
+	// write; a caller that looked it up before and writes to it after has that
+	// write settled, see prometheus.ReviveTracked.
+	//
+	// On the Gather path a child is deleted through Vecs, only if it still
+	// holds what the scrape gathered, checked under the lock of its Vec; through
+	// Delete, which cannot check, so a write between Gather and the deletion is
+	// lost with the child; and with neither, not at all. A caller that looked a
+	// child up before the deletion and writes to it after loses that write --
+	// never keep children of a Vec this deletes from. The Gather path also lets
+	// go of the state of a series it has not gathered for IdleScrapes scrapes:
+	// its child is gone, deleted or its registry replaced, and one that comes
+	// back is new and reported from zero.
+	//
+	// A generous threshold (30 at a 60s interval, i.e. half an hour without
+	// traffic) makes what is left very unlikely; leave the option off to rule
+	// it out and keep every instance resident.
 	IdleScrapes int
 
 	// Delete is called when a series is dropped as idle, to remove the matching
@@ -185,8 +197,30 @@ type Options struct {
 	//	}
 	//
 	// On the change-tracking path this can be left nil: the instance knows the
-	// Vec that created it, and prometheus.DeleteTracked removes it directly.
+	// Vec that created it, and prometheus.DeleteTracked removes it directly. A
+	// child the callback leaves in its Vec keeps its state there.
+	//
+	// On the Gather path set Vecs instead, which checks what Delete cannot:
+	// that nothing was written since the scrape, and that the child really went.
+	// A child Delete leaves in place -- of a family it does not know, a plain
+	// Counter, or a Vec with const labels, which the labels it is given include
+	// and Vec.Delete rejects -- has its state dropped all the same there, and
+	// the next scrape reports its whole value again.
 	Delete func(name string, labels prometheus.Labels)
+
+	// Vecs are what idle cleanup deletes children from on the Gather path, each
+	// matched to the family it gathers as by its name:
+	//
+	//	Vecs: []delta.Vec{tokens, cost, latency},
+	//
+	// A child is deleted only if it still holds what the scrape gathered,
+	// checked under the lock of its Vec, so a write between Gather and the
+	// deletion keeps it. An idle series of a family with no Vec here -- one
+	// left out, a plain Counter, a family a wrapping Registerer renamed -- is
+	// kept, state and all, and the family is logged once to ErrorLog. It cannot
+	// be combined with Delete. The change-tracking path deletes through the
+	// instance and ignores it. See also Exposer.Replace.
+	Vecs []Vec
 
 	// GenLabel, when set, adds this label to counter and histogram output, with
 	// the series' creation time in Unix seconds as its value, so that an instance
@@ -279,6 +313,7 @@ type ScrapeStats struct {
 	Heartbeat int    // of those, how many were heartbeat top-ups
 	Gauges    int    // of those, how many were gauges reported unchanged
 	Deleted   int    // idle series dropped this scrape
+	Forgotten int    // series not gathered for IdleScrapes scrapes whose state was let go (Gather path)
 	Rebased   bool   // the gap since the last delivery exceeded RebaseAfterGap, so the generation moved
 	Delivered bool   // response fully written and the request not cancelled
 	// Aborted: the response broke off midway, so the connection was aborted
@@ -299,6 +334,14 @@ const (
 	SettledRolledBack                   // the scraper did not process it: reported again
 )
 
+// Vec is a Vec idle cleanup can delete children from on the Gather path, see
+// Options.Vecs. *prometheus.CounterVec, GaugeVec, HistogramVec, SummaryVec and
+// MetricVec all are one.
+type Vec interface {
+	prometheus.Collector
+	DeleteCollectedIf(labels []*dto.LabelPair, ok func(prometheus.Metric) bool) bool
+}
+
 // Exposer holds the last delivered values and the idle counters.
 type Exposer struct {
 	g      prometheus.Gatherer
@@ -311,7 +354,9 @@ type Exposer struct {
 	ack    ackState
 	held   []pendingCommit // the round awaiting acknowledgement, see ack.go
 	state  map[string]*entry
-	keyBuf []byte // reused series key; m[string(buf)] looks up without allocating
+	keyBuf []byte          // reused series key; m[string(buf)] looks up without allocating
+	vecs   map[string]Vec  // Options.Vecs by the name of the family each gathers as
+	kept   map[string]bool // families logged for having idle series nothing can delete
 }
 
 type entry struct {
@@ -375,7 +420,69 @@ func (en *entry) ext() *entryExtra {
 // New returns an Exposer reading from g.
 func New(g prometheus.Gatherer, opts Options) *Exposer {
 	opts = check(opts)
-	return &Exposer{g: g, opts: opts, state: map[string]*entry{}, ack: newAckState()}
+	return &Exposer{g: g, opts: opts, state: map[string]*entry{}, ack: newAckState(), vecs: indexVecs(opts.Vecs, opts.Delete != nil)}
+}
+
+// Replace makes the exposer read from g from the next scrape on, and forgets
+// the series it was keeping state for: what they delivered was the old
+// metrics', and the new ones report from zero. vecs take the place of
+// Options.Vecs; they are the new registry's.
+//
+// It is for replacing a registry with a new one whose metrics all start from
+// zero. Without it, a series the new registry has again, under the same name
+// and labels, is reported against what the old one delivered: its first
+// increment comes out short or negative, and the old series that do not come
+// back are kept until IdleScrapes scrapes later. Swapping a Gatherer of one's
+// own and then telling the exposer would let a scrape fall in between, read
+// against the wrong state; Replace does both in one step.
+//
+// A series the new Gatherer shares with the old one -- the same metric, still
+// counting from where it was -- is reported in full again, so replace only
+// what is replaced throughout.
+func (e *Exposer) Replace(g prometheus.Gatherer, vecs ...Vec) {
+	idx := indexVecs(vecs, e.opts.Delete != nil)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.g, e.vecs = g, idx
+	// A round still held for acknowledgement commits into entries no longer
+	// here, which is harmless: the old metrics are gone with them.
+	e.state = map[string]*entry{}
+}
+
+// Tracked returns how many series this exposer is holding state for. It falls
+// as idle series are deleted and as series the Gatherer no longer returns are
+// forgotten.
+func (e *Exposer) Tracked() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.state)
+}
+
+// indexVecs indexes vecs by the name of the family each gathers as.
+func indexVecs(vecs []Vec, withDelete bool) map[string]Vec {
+	if len(vecs) == 0 {
+		return nil
+	}
+	if withDelete {
+		panic("delta: Options.Vecs and Options.Delete are mutually exclusive; Vecs deletes what Delete would, and checks that nothing was written since the scrape")
+	}
+	idx := make(map[string]Vec, len(vecs))
+	for _, v := range vecs {
+		ch := make(chan *prometheus.Desc)
+		go func() { v.Describe(ch); close(ch) }()
+		var names []string
+		for d := range ch {
+			names = append(names, d.Name())
+		}
+		if len(names) != 1 {
+			panic("delta: a Vec in Options.Vecs describes " + strconv.Itoa(len(names)) + " metrics, not one")
+		}
+		if _, dup := idx[names[0]]; dup {
+			panic("delta: two Vecs in Options.Vecs gather as " + names[0])
+		}
+		idx[names[0]] = v
+	}
+	return idx
 }
 
 // check fills in the defaults and rejects combinations that would silently
@@ -446,19 +553,18 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 	e.round++
 	st.Round = e.round
 	st.Rebased = e.rb.due(e.opts.RebaseAfterGap)
-	out, pending, heartbeat := e.plan(mfs)
+	out, pending, idle, heartbeat := e.plan(mfs)
 	st.Families, st.Heartbeat = len(out), heartbeat
 	for _, mf := range out {
 		st.Samples += len(mf.Metric)
 	}
 	// Idle series are dropped now, right after they were read, rather than once
-	// the response is out: a write in between lands on an instance about to be
-	// deleted through Options.Delete, and is lost with it. This path cannot tell
-	// whether one was written since it was read, as change tracking can, so the
-	// window is narrowed to the time since Gather, not closed. A peek drops
-	// nothing.
+	// the response is out. Options.Delete cannot tell whether one was written
+	// since it was read, and a write in between is lost with it, so that window
+	// is kept to the time since Gather; Options.Vecs closes it. A peek drops
+	// nothing. Only a Gather without errors says a series is gone.
 	if !peeks(r) {
-		st.Deleted = e.sweep()
+		st.Deleted, st.Forgotten = e.sweep(idle, err == nil)
 	}
 
 	round := e.ack.roundID(e.round)
@@ -504,9 +610,10 @@ func (e *Exposer) Serve(w http.ResponseWriter, r *http.Request) ScrapeStats {
 	return st
 }
 
-// plan picks the series to write and the values to write for them, and records
-// what to commit once the response is delivered.
-func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pending []pendingCommit, heartbeat int) {
+// plan picks the series to write and the values to write for them, records
+// what to commit once the response is delivered, and lists the idle series
+// sweep can delete.
+func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pending []pendingCommit, idle []idleSeries, heartbeat int) {
 	for _, mf := range mfs {
 		if !e.opts.Only.carries(mf.GetType()) {
 			continue
@@ -515,6 +622,13 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 		for _, m := range mf.Metric {
 			e.keyBuf = appendSeriesKey(e.keyBuf[:0], mf.GetName(), m.Label)
 			en := e.state[string(e.keyBuf)]
+			if en != nil && (en.kind != mf.GetType() || rebuilt(m, en)) {
+				// A new instance under an old name and labels: the old one was
+				// deleted, or its registry replaced, without Replace. It has
+				// delivered nothing, so it starts over as new rather than being
+				// reported against what the old one delivered.
+				en = nil
+			}
 			if en == nil {
 				en = &entry{kind: mf.GetType(), changed: e.round, born: uint32(e.rb.clock().Unix())}
 				if e.opts.Delete != nil {
@@ -523,6 +637,7 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 				e.state[string(e.keyBuf)] = en
 			}
 			en.lastRound = e.round
+			labels := m.Label // decide may stamp the generation on m
 
 			emit, hb, pc := e.decide(mf, m, en)
 			if hb {
@@ -534,13 +649,76 @@ func (e *Exposer) plan(mfs []*dto.MetricFamily) (out []*dto.MetricFamily, pendin
 			if emit {
 				kept = append(kept, m)
 			}
+			if e.isIdle(en) && e.canDelete(mf.GetName()) {
+				idle = append(idle, idleSeries{key: string(e.keyBuf), en: en, family: mf.GetName(), labels: labels})
+			}
 		}
 		if len(kept) > 0 {
 			mf.Metric = kept
 			out = append(out, mf)
 		}
 	}
-	return out, pending, heartbeat
+	return out, pending, idle, heartbeat
+}
+
+// idleSeries is a series plan found idle, with the labels it was gathered with.
+type idleSeries struct {
+	key    string
+	en     *entry
+	family string
+	labels []*dto.LabelPair
+}
+
+// isIdle reports whether a series is due for deletion.
+func (e *Exposer) isIdle(en *entry) bool {
+	return e.opts.IdleScrapes > 0 && e.round-en.changed > uint64(e.opts.IdleScrapes) && deletable(en)
+}
+
+// canDelete reports whether an idle series of family can be deleted, and logs a
+// family that cannot, once.
+func (e *Exposer) canDelete(family string) bool {
+	if e.vecs[family] != nil || e.opts.Delete != nil {
+		return true
+	}
+	if e.opts.ErrorLog != nil && !e.kept[family] {
+		if e.kept == nil {
+			e.kept = map[string]bool{}
+		}
+		e.kept[family] = true
+		if e.vecs != nil {
+			e.opts.ErrorLog.Println("delta: idle series of", family, "are kept, not deleted: no Vec in Options.Vecs gathers as it")
+		} else {
+			e.opts.ErrorLog.Println("delta: idle series of", family, "are kept, not deleted: on the Gather path idle cleanup deletes through Options.Vecs, and none is set")
+		}
+	}
+	return false
+}
+
+// rebuilt reports whether m holds less than en delivered, which a counter or a
+// classic histogram only does as a new instance.
+func rebuilt(m *dto.Metric, en *entry) bool {
+	switch en.kind {
+	case dto.MetricType_COUNTER:
+		return m.GetCounter().GetValue() < en.value
+	case dto.MetricType_HISTOGRAM:
+		h := m.GetHistogram()
+		if isNative(h) {
+			return false // not differenced, see decide
+		}
+		sum, count, buckets := en.delivered()
+		if h.GetSampleCount() < count {
+			return true
+		}
+		if h.GetSampleCount() == count && h.GetSampleSum() == sum {
+			return false // unchanged
+		}
+		for i, b := range h.Bucket {
+			if i < len(buckets) && b.GetCumulativeCount() < buckets[i] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type pendingCommit struct {
@@ -580,6 +758,7 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 		if isNative(h) {
 			// A native histogram is not differenced and cannot be compared on a
 			// single value: pass it through.
+			e.sawActivity(m, en)
 			return true, false, nil
 		}
 		sum, count := h.GetSampleSum(), h.GetSampleCount()
@@ -634,8 +813,38 @@ func (e *Exposer) decide(mf *dto.MetricFamily, m *dto.Metric, en *entry) (bool, 
 
 	default:
 		// summary / untyped: quantiles are not additive, pass them through.
+		e.sawActivity(m, en)
 		return true, false, nil
 	}
+}
+
+// sawActivity records whether a series that is passed through as it is was
+// written, for idle cleanup, which would otherwise take one observed every
+// scrape for idle and delete it with everything it holds. Its entry's value,
+// which nothing else uses, keeps what tells: see activity.
+func (e *Exposer) sawActivity(m *dto.Metric, en *entry) {
+	if v, ok := activity(m); ok && v != en.value {
+		en.value = v
+		en.changed = e.round
+	}
+}
+
+// activity returns what changes when a series passed through as it is gets
+// written: a summary's or a native histogram's count of observations, or an
+// untyped value.
+func activity(m *dto.Metric) (float64, bool) {
+	switch {
+	case m.Summary != nil:
+		return float64(m.Summary.GetSampleCount()), true
+	case m.Histogram != nil:
+		if f := m.Histogram.GetSampleCountFloat(); f != 0 {
+			return f, true
+		}
+		return float64(m.Histogram.GetSampleCount()), true
+	case m.Untyped != nil:
+		return m.Untyped.GetValue(), true
+	}
+	return 0, false
 }
 
 // stamp puts the generation label on a counter or histogram. Gauges never carry
@@ -735,23 +944,69 @@ func (pc *pendingCommit) apply() {
 	}
 }
 
-// sweep drops series with no write for IdleScrapes scrapes in a row.
-func (e *Exposer) sweep() int {
-	idle := uint64(e.opts.IdleScrapes)
-	if idle == 0 {
-		return 0
+// sweep deletes the idle series plan listed, and lets go of the state of the
+// series not gathered for IdleScrapes scrapes, when complete says this scrape's
+// Gather had no error and so returned every series there is. It returns how
+// many it deleted and how many it let go.
+func (e *Exposer) sweep(idle []idleSeries, complete bool) (deleted, forgotten int) {
+	after := uint64(e.opts.IdleScrapes)
+	if after == 0 {
+		return 0, 0
 	}
-	n := 0
-	for k, en := range e.state {
-		if en.lastRound == e.round && e.round-en.changed > idle && deletable(en) {
-			delete(e.state, k)
-			if e.opts.Delete != nil {
-				e.opts.Delete(en.del.family, en.del.labels)
-			}
-			n++
+	for i := range idle {
+		if e.deleteIdle(&idle[i]) {
+			delete(e.state, idle[i].key)
+			deleted++
 		}
 	}
-	return n
+	if !complete {
+		return deleted, 0
+	}
+	for k, en := range e.state {
+		// Not gathered for that long: its child is gone, deleted by the
+		// application or its registry replaced. Nothing is deleted through Vecs
+		// or Delete for it, which would find a new child of the same labels.
+		if e.round-en.lastRound > after {
+			delete(e.state, k)
+			forgotten++
+		}
+	}
+	return deleted, forgotten
+}
+
+// deleteIdle deletes the child of an idle series, and reports whether it went.
+// A child that stays keeps its state: let go, the next scrape would report its
+// whole value again.
+func (e *Exposer) deleteIdle(s *idleSeries) bool {
+	if v := e.vecs[s.family]; v != nil {
+		// Written since it was gathered, it stays, and the next scrape reports
+		// the write; found idle again later, it is deleted then.
+		return v.DeleteCollectedIf(s.labels, func(m prometheus.Metric) bool { return unwritten(m, s.en) })
+	}
+	// Delete cannot say whether it removed the child, nor be asked to remove it
+	// only if it was not written since it was gathered; see Options.Delete.
+	e.opts.Delete(s.en.del.family, s.en.del.labels)
+	return true
+}
+
+// unwritten reports whether m, the child of an idle series, still holds what
+// the series' entry last saw: nothing was written to it since it was gathered.
+func unwritten(m prometheus.Metric, en *entry) bool {
+	var d dto.Metric
+	if err := m.Write(&d); err != nil {
+		return false
+	}
+	switch {
+	case d.Counter != nil:
+		return d.Counter.GetValue() == en.value
+	case d.Gauge != nil:
+		return d.Gauge.GetValue() == en.value
+	case d.Histogram != nil && !isNative(d.Histogram):
+		sum, count, _ := en.delivered()
+		return d.Histogram.GetSampleCount() == count && d.Histogram.GetSampleSum() == sum
+	}
+	v, ok := activity(&d)
+	return ok && v == en.value
 }
 
 // appendSeriesKey appends the series identity to dst. Labels from Gather are
