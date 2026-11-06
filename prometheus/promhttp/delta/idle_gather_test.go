@@ -16,6 +16,7 @@ package delta
 import (
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -329,8 +330,10 @@ func TestGatherForgetsSeriesNoLongerGathered(t *testing.T) {
 		return c
 	}
 	g := prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return cur.Gather() })
-	f := &fixture{exp: New(g, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2})}
 	a := mk()
+	// The family is in Vecs, which is what says a series missing from a scrape
+	// is gone; that the Vec given is a's, not b's, makes no difference to it.
+	f := &fixture{exp: New(g, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, Vecs: []Vec{a}})}
 	a.WithLabelValues("x").Add(3)
 	a.WithLabelValues("y").Add(4)
 	f.scrape(t, false)
@@ -364,7 +367,8 @@ func TestGatherErrorsForgetNothing(t *testing.T) {
 		}
 		return reg.Gather()
 	})
-	f := &fixture{exp: New(g, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2})}
+	// with c in Vecs, so that a scrape that misses x could take it for gone
+	f := &fixture{exp: New(g, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, Vecs: []Vec{c}})}
 	c.WithLabelValues("x").Add(3)
 	f.scrape(t, false)
 	fail = true
@@ -422,4 +426,228 @@ func TestBusyPassThroughSeriesAreNotIdle(t *testing.T) {
 			t.Fatalf("%d deletions once it stopped, want 1", deleted)
 		}
 	})
+}
+
+type collectorFunc struct {
+	d *prometheus.Desc
+	f func(chan<- prometheus.Metric)
+}
+
+func (c collectorFunc) Describe(ch chan<- *prometheus.Desc) { ch <- c.d }
+func (c collectorFunc) Collect(ch chan<- prometheus.Metric) { c.f(ch) }
+
+// A collector other than a Vec may leave a series out of a scrape, without an
+// error, and bring it back counting on from where it was: it keeps its state
+// however long it was away, and is not reported again in full.
+func TestGatherSeriesLeftOutKeepsState(t *testing.T) {
+	for _, withVecs := range []bool{false, true} {
+		t.Run(fmt.Sprint("vecs=", withVecs), func(t *testing.T) {
+			desc := prometheus.NewDesc("conn_bytes_total", "per connected client", []string{"client"}, nil)
+			value, present := 1000.0, true
+			reg := prometheus.NewRegistry()
+			reg.MustRegister(collectorFunc{desc, func(ch chan<- prometheus.Metric) {
+				if present {
+					ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, "x")
+				}
+			}})
+			opts := Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2}
+			if withVecs {
+				// Vecs for another family: the series left out is still not
+				// taken for gone
+				other := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "other_total", Help: "o"}, []string{"k"})
+				reg.MustRegister(other)
+				opts.Vecs = []Vec{other}
+			}
+			f := &fixture{exp: New(reg, opts)}
+			sum, st := f.scrapes(t, 1)
+			present = false
+			_, st2 := f.scrapes(t, 4)
+			present, value = true, 1005
+			sum2, st3 := f.scrapes(t, 1)
+			if got := sum["conn_bytes_total{client=x}"] + sum2["conn_bytes_total{client=x}"]; got != 1005 {
+				t.Fatalf("reported %v in all for a counter that reached 1005", got)
+			}
+			if n := st.Forgotten + st2.Forgotten + st3.Forgotten; n != 0 {
+				t.Fatalf("forgot %d series", n)
+			}
+		})
+	}
+}
+
+// An Options.Delete that leaves an idle child in place -- it does not know the
+// family, or its Vec rejects the labels -- does not cost the child its state:
+// the next scrape finds the same instance and carries on from where it was.
+func TestGatherDeleteThatLeavesTheChildKeepsState(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cost := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cost_total", Help: "c"}, []string{"key"})
+	reg.MustRegister(cost)
+	calls, log := 0, &testLog{}
+	f := &fixture{exp: New(reg, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, ErrorLog: log,
+		Delete: func(string, prometheus.Labels) { calls++ }})}
+	cost.WithLabelValues("a").Add(100)
+	sum, _ := f.scrapes(t, 10)
+	if calls < 2 {
+		t.Fatalf("Delete called %d times in 10 scrapes, want it offered the series again once idle again", calls)
+	}
+	cost.WithLabelValues("a").Add(1)
+	sum2, _ := f.scrapes(t, 1)
+	if sum["cost_total{key=a}"] != 100 || sum2["cost_total{key=a}"] != 1 {
+		t.Fatalf("reported %v then %v for 100 then 1 written", sum["cost_total{key=a}"], sum2["cost_total{key=a}"])
+	}
+	if n := f.exp.Tracked(); n != 1 {
+		t.Fatalf("tracked %d, want 1", n)
+	}
+	if len(log.lines) != 1 || !strings.Contains(log.lines[0], "left idle series of cost_total in place") {
+		t.Fatalf("logged %q, want one line on cost_total", log.lines)
+	}
+}
+
+// One that does delete the child lets the state go, and a child created anew
+// under the same labels before the next scrape is told apart by its creation
+// time even once it holds more than the old one delivered.
+func TestGatherDeleteThatDeletesLetsGo(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	cost := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "cost_total", Help: "c"}, []string{"key"})
+	reg.MustRegister(cost)
+	f := &fixture{exp: New(reg, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2,
+		Delete: func(_ string, l prometheus.Labels) { cost.Delete(l) }})}
+	cost.WithLabelValues("a").Add(100)
+	sum, renewed := map[string]float64{}, false
+	for range 10 {
+		m, st := f.scrape(t, false)
+		sum["a"] += m["cost_total{key=a}"]
+		if st.Deleted > 0 && !renewed {
+			cost.WithLabelValues("a").Add(150) // a new child
+			renewed = true
+		}
+	}
+	if sum["a"] != 250 {
+		t.Fatalf("reported %v for 100 written to one child and 150 to its successor", sum["a"])
+	}
+}
+
+// After Replace, an Options.Delete still bound to the old registry deletes
+// nothing in the new one, which keeps its state; what was logged once under
+// the old registry is logged again under the new.
+func TestGatherReplaceWithStaleDelete(t *testing.T) {
+	mk := func() (*prometheus.Registry, *prometheus.CounterVec) {
+		reg := prometheus.NewRegistry()
+		c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "c_total", Help: "c"}, []string{"key"})
+		reg.MustRegister(c)
+		return reg, c
+	}
+	regA, a := mk()
+	log := &testLog{}
+	f := &fixture{exp: New(regA, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, ErrorLog: log,
+		Delete: func(_ string, l prometheus.Labels) {
+			if l["key"] != "k" { // one it leaves in place, logged under A
+				a.Delete(l)
+			}
+		}})}
+	a.WithLabelValues("k").Inc()
+	a.WithLabelValues("z").Inc()
+	f.scrapes(t, 6)
+	if n := children(a); n != 1 {
+		t.Fatalf("%d children left in the old registry, want only k", n)
+	}
+
+	regB, b := mk()
+	f.exp.Replace(regB)
+	b.WithLabelValues("x").Add(50)
+	sum, _ := f.scrapes(t, 8)
+	b.WithLabelValues("x").Inc()
+	sum2, _ := f.scrapes(t, 1)
+	if sum["c_total{key=x}"] != 50 || sum2["c_total{key=x}"] != 1 {
+		t.Fatalf("reported %v then %v for 50 then 1 written", sum["c_total{key=x}"], sum2["c_total{key=x}"])
+	}
+	if n := children(b); n != 1 {
+		t.Fatalf("%d children left in the new registry, want 1", n)
+	}
+	var left int
+	for _, l := range log.lines {
+		if strings.Contains(l, "left idle series of c_total") {
+			left++
+		}
+	}
+	if left != 2 {
+		t.Fatalf("logged %q, want a line for each registry", log.lines)
+	}
+}
+
+// countingVec counts what idle cleanup asks of a Vec.
+type countingVec struct {
+	*prometheus.CounterVec
+	calls int
+}
+
+func (v *countingVec) DeleteCollectedIf(l []*dto.LabelPair, ok func(prometheus.Metric) bool) bool {
+	v.calls++
+	return v.CounterVec.DeleteCollectedIf(l, ok)
+}
+
+// A Vec in Options.Vecs that does not hold a child -- curried to other values,
+// or not the one registered -- cannot delete it: that is logged once, and the
+// child is tried again after IdleScrapes more scrapes, not every scrape.
+func TestGatherVecThatDoesNotHoldTheChild(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		vec  func(*prometheus.CounterVec) *prometheus.CounterVec
+		held int // how many of the two children the Vec holds
+	}{
+		{"curried", func(c *prometheus.CounterVec) *prometheus.CounterVec {
+			return c.MustCurryWith(prometheus.Labels{"tier": "free"})
+		}, 1},
+		{"unregistered", func(*prometheus.CounterVec) *prometheus.CounterVec {
+			return prometheus.NewCounterVec(prometheus.CounterOpts{Name: "c_total", Help: "c"}, []string{"key", "tier"})
+		}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := prometheus.NewRegistry()
+			c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: "c_total", Help: "c"}, []string{"key", "tier"})
+			reg.MustRegister(c)
+			v, log := &countingVec{CounterVec: tc.vec(c)}, &testLog{}
+			f := &fixture{exp: New(reg, Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2, ErrorLog: log, Vecs: []Vec{v}})}
+			c.WithLabelValues("a", "paid").Inc()
+			c.WithLabelValues("a", "free").Inc()
+			_, st := f.scrapes(t, 13)
+
+			if n := children(c); n != 2-tc.held {
+				t.Fatalf("%d children left, want %d", n, 2-tc.held)
+			}
+			// idle first after 3 scrapes, then every 3 more: 4 tries in 13
+			// scrapes for each series the Vec cannot delete, not 10
+			if tries := v.calls - st.Deleted; tries > 4*(2-tc.held) {
+				t.Fatalf("tried %d times to delete the %d series the Vec does not hold", tries, 2-tc.held)
+			}
+			if len(log.lines) != 1 || !strings.Contains(log.lines[0], "does not hold it") {
+				t.Fatalf("logged %q, want one line", log.lines)
+			}
+		})
+	}
+}
+
+// A histogram served as a gauge histogram is idle when its count has not moved,
+// as decide sees it, and is deleted as such.
+func TestGatherGaugeHistogramIsDeleted(t *testing.T) {
+	asGauge := func(g prometheus.Gatherer) prometheus.Gatherer {
+		return prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) {
+			mfs, err := g.Gather()
+			for _, mf := range mfs {
+				if mf.GetName() == "h" {
+					mf.Type = dto.MetricType_GAUGE_HISTOGRAM.Enum()
+				}
+			}
+			return mfs, err
+		})
+	}
+	f := newGatherFixture(Options{ReportIncrements: true, DisableHeartbeat: true, IdleScrapes: 2}, true, asGauge)
+	f.h.WithLabelValues("a").Observe(7)
+	var deleted int
+	for range 6 {
+		rec := httptest.NewRecorder()
+		deleted += f.exp.Serve(rec, httptest.NewRequest("GET", "/metrics/delta", nil)).Deleted
+	}
+	if deleted != 1 || children(f.h) != 0 {
+		t.Fatalf("deleted %d, %d children left; want the idle gauge histogram deleted", deleted, children(f.h))
+	}
 }
